@@ -1,0 +1,5 @@
+# Observer core uses only the Python standard library.
+# GUI control dependencies are optional until executor.py is switched to pyautogui.
+pyautogui>=0.9.54
+pillow>=10.0.0
+opencv-python>=4.8.0

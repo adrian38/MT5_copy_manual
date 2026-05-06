@@ -1,0 +1,314 @@
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+from typing import Any
+
+from .csv_reader import read_csv_rows
+from .mapping import load_mapping, upsert_mapping
+from .models import ChangeEvent, ChangeType
+from .mt5_gui import GuiConfig, GuiSafetyError, Mt5GuiController
+
+
+class DryRunExecutor:
+    """Placeholder executor. It never opens, modifies, or closes trades."""
+
+    def __init__(self, logger: logging.Logger) -> None:
+        self.logger = logger
+
+    def handle(self, event: ChangeEvent) -> None:
+        self.logger.info(
+            "DRY RUN event=%s source_ticket=%s symbol=%s type=%s changes=%s",
+            event.change_type.value,
+            event.source_ticket,
+            event.symbol,
+            event.trade_type,
+            event.changed_fields,
+        )
+
+
+class PyAutoGuiExecutor:
+    """Safe adapter for MT5 GUI automation. Trading actions are blocked unless armed."""
+
+    def __init__(
+        self,
+        gui: Mt5GuiController,
+        logger: logging.Logger,
+        mapping_file: Path | None = None,
+        destination_orders_file: Path | None = None,
+    ) -> None:
+        self.gui = gui
+        self.logger = logger
+        self.mapping_file = mapping_file
+        self.destination_orders_file = destination_orders_file
+
+    def handle(self, event: ChangeEvent) -> None:
+        if event.change_type == ChangeType.ORDER_CREATED:
+            self._prepare_order_created(event)
+            return
+
+        if event.change_type == ChangeType.ORDER_DELETED:
+            self._delete_order(event)
+            return
+
+        if event.change_type == ChangeType.POSITION_OPENED:
+            self._prepare_market_position(event)
+            return
+
+        if event.change_type in {
+            ChangeType.ORDER_UPDATED,
+            ChangeType.POSITION_UPDATED,
+            ChangeType.POSITION_CLOSED,
+        }:
+            self._log_unsupported_action(event)
+            return
+
+        self.logger.warning("Unhandled event type for GUI executor: %s", event.change_type)
+
+    def _prepare_order_created(self, event: ChangeEvent) -> None:
+        if not event.current:
+            self.logger.warning("ORDER_CREATED event has no current row: %s", event.to_dict())
+            return
+
+        prepared = self.gui.prepare_pending_order(event.current)
+        self.logger.info(
+            "ORDER_CREATED prepared source_ticket=%s symbol=%s type=%s volume=%s price=%s sl=%s tp=%s screenshot=%s",
+            prepared["source_ticket"],
+            prepared["symbol"],
+            prepared["type"],
+            prepared["volume"],
+            prepared["price_open"],
+            prepared["sl"],
+            prepared["tp"],
+            prepared["screenshot_order_window"],
+        )
+
+    def _prepare_market_position(self, event: ChangeEvent) -> None:
+        if not event.current:
+            self.logger.warning("POSITION_OPENED event has no current row: %s", event.to_dict())
+            return
+
+        prepared = self.gui.prepare_market_order(event.current)
+        self.logger.info(
+            "POSITION_OPENED prepared source_ticket=%s symbol=%s type=%s volume=%s sl=%s tp=%s screenshot=%s",
+            prepared["source_ticket"],
+            prepared["symbol"],
+            prepared["type"],
+            prepared["volume"],
+            prepared["sl"],
+            prepared["tp"],
+            prepared["screenshot_order_window"],
+        )
+
+    def _delete_order(self, event: ChangeEvent) -> None:
+        if self.mapping_file is None:
+            self.logger.warning(
+                "ORDER_DELETED cannot execute because mapping_file is not configured source_ticket=%s",
+                event.source_ticket,
+            )
+            return
+
+        mapping = load_mapping(self.mapping_file)
+        map_row = mapping.get(str(event.source_ticket))
+        if not map_row:
+            self.logger.warning(
+                "ORDER_DELETED has no destination mapping source_ticket=%s",
+                event.source_ticket,
+            )
+            return
+
+        if map_row.get("status") != "placed":
+            self.logger.info(
+                "ORDER_DELETED ignored because mapping status is %s source_ticket=%s destination_ticket=%s",
+                map_row.get("status", ""),
+                event.source_ticket,
+                map_row.get("destination_ticket", ""),
+            )
+            return
+
+        destination_ticket = str(map_row.get("destination_ticket", ""))
+        row_center = self._visible_order_row_center(destination_ticket)
+        if row_center is None:
+            self.logger.warning(
+                "ORDER_DELETED skipped because destination ticket is not visible/current source_ticket=%s destination_ticket=%s",
+                event.source_ticket,
+                destination_ticket,
+            )
+            return
+
+        destination_row = self._destination_order_row(destination_ticket)
+        if destination_row is None:
+            self.logger.warning(
+                "ORDER_DELETED skipped because destination row is missing source_ticket=%s destination_ticket=%s",
+                event.source_ticket,
+                destination_ticket,
+            )
+            return
+
+        source_row = event.previous or {}
+        mismatches = _order_field_mismatches(source_row, destination_row)
+        if mismatches:
+            self.logger.warning(
+                "ORDER_DELETED skipped because mapped destination does not match deleted source source_ticket=%s destination_ticket=%s mismatches=%s",
+                event.source_ticket,
+                destination_ticket,
+                mismatches,
+            )
+            return
+
+        screenshot = self.gui.delete_pending_order(destination_ticket, row_center=row_center)
+        updated = dict(map_row)
+        updated["status"] = "canceled"
+        upsert_mapping(self.mapping_file, updated)
+        self.logger.info(
+            "ORDER_DELETED executed source_ticket=%s destination_ticket=%s screenshot=%s",
+            event.source_ticket,
+            destination_ticket,
+            screenshot,
+        )
+
+    def _destination_order_row(self, destination_ticket: str) -> dict[str, Any] | None:
+        if self.destination_orders_file is None:
+            return None
+        for row in read_csv_rows(self.destination_orders_file):
+            if str(row.get("ticket", "")) == destination_ticket:
+                return row
+        return None
+
+    def _log_unsupported_action(self, event: ChangeEvent) -> None:
+        try:
+            focused = self.gui.focus_mt5()
+            screenshot_path = self.gui.screenshot(event.change_type.value)
+            self.logger.info(
+                "GUI READY focused=%s event=%s source_ticket=%s screenshot=%s",
+                focused,
+                event.change_type.value,
+                event.source_ticket,
+                screenshot_path,
+            )
+        except GuiSafetyError:
+            raise
+        except Exception:
+            self.logger.exception("GUI preparation failed for event: %s", event.to_dict())
+
+    def _visible_order_row_center(self, destination_ticket: str) -> tuple[int, int] | None:
+        if self.destination_orders_file is None:
+            return None
+
+        rows = read_csv_rows(self.destination_orders_file)
+        tickets = [str(row.get("ticket", "")) for row in rows]
+        if destination_ticket not in tickets:
+            return None
+
+        index = tickets.index(destination_ticket)
+        coordinates = self.gui.config.order_form_coordinates
+        anchor_x, top_y = coordinates.get("order_row_anchor", (253, 741))
+        _, step_y = coordinates.get("order_row_step_y", (0, 20))
+        y = top_y + (index * step_y)
+        return anchor_x, y
+
+
+def _order_field_mismatches(
+    source_row: dict[str, Any],
+    destination_row: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    fields = ("symbol", "type", "price_open", "sl", "tp")
+    mismatches: dict[str, dict[str, Any]] = {}
+
+    for field in fields:
+        source_value = _normalize_compare_value(source_row.get(field))
+        destination_value = _normalize_compare_value(destination_row.get(field))
+        if source_value != destination_value:
+            mismatches[field] = {
+                "source": source_row.get(field),
+                "destination": destination_row.get(field),
+            }
+
+    source_volume = _normalize_compare_value(
+        source_row.get("volume_current", source_row.get("volume_initial", ""))
+    )
+    destination_volume = _normalize_compare_value(
+        destination_row.get("volume_current", destination_row.get("volume_initial", ""))
+    )
+    if source_volume != destination_volume:
+        mismatches["volume"] = {
+            "source": source_row.get("volume_current", source_row.get("volume_initial", "")),
+            "destination": destination_row.get("volume_current", destination_row.get("volume_initial", "")),
+        }
+
+    return mismatches
+
+
+def _normalize_compare_value(value: Any) -> str:
+    if value in {None, ""}:
+        return ""
+    try:
+        return f"{float(value):.5f}"
+    except (TypeError, ValueError):
+        return str(value).strip().upper()
+
+
+def gui_config_from_executor_settings(settings: dict[str, Any], project_root: Path) -> GuiConfig:
+    def project_path(value: str) -> Path:
+        path = Path(value)
+        if path.is_absolute():
+            return path
+        return project_root / path
+
+    return GuiConfig(
+        window_title_contains=str(settings.get("mt5_window_title_contains", "MetaTrader")),
+        screenshot_dir=project_path(str(settings.get("screenshot_dir", "data/screenshots"))),
+        image_dir=project_path(str(settings.get("image_dir", "data/images"))),
+        image_confidence=float(settings.get("image_confidence", 0.85)),
+        action_pause_seconds=float(settings.get("action_pause_seconds", 0.15)),
+        fail_safe=bool(settings.get("fail_safe", True)),
+        armed_for_trading=bool(settings.get("armed_for_trading", False)),
+        submit_orders=bool(settings.get("submit_orders", False)),
+        new_order_hotkey=tuple(settings.get("new_order_hotkey", ["f9"])),
+        new_order_button=(
+            tuple(int(part) for part in settings["new_order_button"])
+            if "new_order_button" in settings
+            else None
+        ),
+        order_dialog_title_contains=str(settings.get("order_dialog_title_contains", "Orden")),
+        order_window_delay_seconds=float(settings.get("order_window_delay_seconds", 1.0)),
+        field_delay_seconds=float(settings.get("field_delay_seconds", 0.25)),
+        comment_prefix=str(settings.get("comment_prefix", "COPY_")),
+        order_form_coordinates={
+            key: (int(value[0]), int(value[1]))
+            for key, value in dict(settings.get("order_form_coordinates", {})).items()
+        },
+    )
+
+
+def build_gui_controller(
+    executor_settings: dict[str, Any],
+    project_root: Path,
+    logger: logging.Logger,
+) -> Mt5GuiController:
+    return Mt5GuiController(
+        gui_config_from_executor_settings(executor_settings, project_root),
+        logger,
+    )
+
+
+def build_executor(
+    mode: str,
+    pyautogui_enabled: bool,
+    logger: logging.Logger,
+    executor_settings: dict[str, Any] | None = None,
+    project_root: Path | None = None,
+    mapping_file: Path | None = None,
+    destination_orders_file: Path | None = None,
+):
+    if mode == "pyautogui" and pyautogui_enabled:
+        if executor_settings is None or project_root is None:
+            raise ValueError("executor_settings and project_root are required for pyautogui mode")
+        gui = build_gui_controller(executor_settings, project_root, logger)
+        return PyAutoGuiExecutor(
+            gui,
+            logger,
+            mapping_file=mapping_file,
+            destination_orders_file=destination_orders_file,
+        )
+    return DryRunExecutor(logger)

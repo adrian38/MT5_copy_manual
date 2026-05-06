@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+logs/*.log
+logs/*.log.*
+data/state/*.json
+data/state/*.tmp
+data/screenshots/*.png
