@@ -81,6 +81,7 @@ if "%ISCC%"=="" (
     "%ISCC%" installer.iss
     if exist "dist\MT5CopyManual_Setup_1.0.0.exe" (
         echo [OK] Instalador generado en: dist\MT5CopyManual_Setup_1.0.0.exe
+        echo [INFO] El instalador requiere permisos de administrador para ejecutarse.
     ) else (
         echo [ERROR] Fallo la compilacion del instalador. Revisa los mensajes de ISCC arriba.
         pause & exit /b 1

@@ -14,8 +14,8 @@ AppVersion={#AppVersion}
 AppPublisher={#AppPublisher}
 AppVerName={#AppName} {#AppVersion}
 
-; Instala en Documentos del usuario para que config y logs sean escribibles
-DefaultDirName={userdocs}\MT5CopyManual
+; AppData\Local: escribible en runtime, no sincronizado por OneDrive
+DefaultDirName={localappdata}\MT5CopyManual
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
 
@@ -30,8 +30,8 @@ SolidCompression=yes
 ; UI
 WizardStyle=modern
 
-; Sin necesidad de admin (instala solo para el usuario)
-PrivilegesRequired=lowest
+; Requiere administrador para instalar
+PrivilegesRequired=admin
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 

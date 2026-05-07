@@ -456,6 +456,9 @@ class CopyMonitorApp:
         self.logger.info("Notificaciones Telegram %s", estado)
 
     def _calibrate_coordinates(self) -> None:
+        # Resolution the bundled coordinates were designed for
+        _ORIGIN_W, _ORIGIN_H = 1920, 1080
+
         try:
             import pyautogui as _pag
             current_w, current_h = _pag.size()
@@ -468,26 +471,22 @@ class CopyMonitorApp:
 
         executor = raw.setdefault("executor", {})
 
+        # Initialize baseline the first time, always anchored to the original 1920x1080
         if "coordinate_baseline" not in raw:
             raw["coordinate_baseline"] = {
-                "resolution": [current_w, current_h],
+                "resolution": [_ORIGIN_W, _ORIGIN_H],
                 "order_form_coordinates": executor.get("order_form_coordinates", {}),
                 "new_order_button": executor.get("new_order_button"),
             }
-            with self.config_path.open("w", encoding="utf-8") as fh:
-                json.dump(raw, fh, indent=2)
-                fh.write("\n")
-            messagebox.showinfo(
-                "Calibrar pantalla",
-                f"Baseline guardado para {current_w}x{current_h}.\n"
-                "Esta resolución se usará como referencia para futuras calibraciones.",
-            )
-            return
 
         baseline = raw["coordinate_baseline"]
         base_w, base_h = baseline["resolution"]
 
         if base_w == current_w and base_h == current_h:
+            # Also save baseline if it was just created
+            with self.config_path.open("w", encoding="utf-8") as fh:
+                json.dump(raw, fh, indent=2)
+                fh.write("\n")
             messagebox.showinfo(
                 "Calibrar pantalla",
                 f"Las coordenadas ya están calibradas para {current_w}x{current_h}.",

@@ -8,10 +8,22 @@ from typing import Any
 
 
 def _get_project_root() -> Path:
-    # When bundled with PyInstaller, resolve paths relative to the .exe
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).resolve().parents[2]
+    if not getattr(sys, "frozen", False):
+        return Path(__file__).resolve().parents[2]
+
+    # PyInstaller: user-writable root is the folder that contains the .exe.
+    # In PyInstaller 6.x onedir mode, bundled datas land in _internal/ (_MEIPASS),
+    # but settings.json must be editable, so we keep it next to the .exe.
+    # On first run the bundled template is copied there automatically.
+    exe_dir = Path(sys.executable).parent
+    user_config = exe_dir / "config" / "settings.json"
+    if not user_config.exists():
+        bundled = Path(getattr(sys, "_MEIPASS", exe_dir)) / "config" / "settings.json"
+        if bundled.exists():
+            import shutil
+            user_config.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(bundled, user_config)
+    return exe_dir
 
 
 PROJECT_ROOT = _get_project_root()
