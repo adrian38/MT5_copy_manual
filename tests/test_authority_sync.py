@@ -64,7 +64,7 @@ class FakePositionGui:
         _write_position_rows(self.destination_file, rows)
         return {}
 
-    def close_position(self, destination_ticket, row_center=None):
+    def close_position(self, destination_ticket, row_center=None, trade_type=None):
         self.closed.append(destination_ticket)
         self.row_centers.append(row_center)
         rows = [row for row in _read_position_rows(self.destination_file) if row["ticket"] != destination_ticket]

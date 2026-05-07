@@ -44,7 +44,7 @@
   },
   "notifications": {
     "telegram": {
-      "enabled": true,
+      "enabled": false,
       "bot_token": "8513055575:AAE1RYJ4F_WFoHLq47c2ltU0vorFE3nbOyI",
       "chat_id": "-1003519136130",
       "prefix": "MT5 COPY"
@@ -66,8 +66,8 @@
       "f9"
     ],
     "new_order_button": [
-      489,
-      59
+      348,
+      42
     ],
     "order_dialog_title_contains": "Orden",
     "order_window_delay_seconds": 1.0,
@@ -76,6 +76,174 @@
     "order_search_scroll_clicks": 7,
     "order_search_arrow_down_presses": 8,
     "comment_prefix": "COPY_",
+    "order_form_coordinates": {
+      "symbol": [
+        884,
+        214
+      ],
+      "execution_type": [
+        884,
+        243
+      ],
+      "pending_type": [
+        773,
+        289
+      ],
+      "pending_type_option_base": [
+        772,
+        305
+      ],
+      "pending_type_option_step_y": [
+        0,
+        14
+      ],
+      "volume": [
+        763,
+        317
+      ],
+      "price_open": [
+        763,
+        345
+      ],
+      "sl": [
+        763,
+        374
+      ],
+      "tp": [
+        994,
+        374
+      ],
+      "modify": [
+        731,
+        470
+      ],
+      "modify_sl": [
+        770,
+        318
+      ],
+      "modify_tp": [
+        994,
+        318
+      ],
+      "delete": [
+        948,
+        470
+      ],
+      "order_row_anchor": [
+        180,
+        409
+      ],
+      "order_row_step_y": [
+        0,
+        20
+      ],
+      "order_scan_rows": [
+        0,
+        12
+      ],
+      "order_list_scroll_point": [
+        180,
+        669
+      ],
+      "order_row_max_y": [
+        0,
+        669
+      ],
+      "position_row_fallback": [
+        180,
+        409
+      ],
+      "position_row_anchor": [
+        180,
+        409
+      ],
+      "position_row_step_y": [
+        0,
+        20
+      ],
+      "position_row_max_y": [
+        0,
+        669
+      ],
+      "position_context_modify": [
+        270,
+        353
+      ],
+      "position_modify_sl": [
+        770,
+        289
+      ],
+      "position_modify_tp": [
+        770,
+        318
+      ],
+      "position_modify": [
+        839,
+        420
+      ],
+      "position_close_x": [
+        1358,
+        409
+      ],
+      "one_click_terms_checkbox": [
+        525,
+        465
+      ],
+      "one_click_accept": [
+        760,
+        465
+      ],
+      "market_volume": [
+        763,
+        289
+      ],
+      "market_sl": [
+        763,
+        317
+      ],
+      "market_tp": [
+        994,
+        317
+      ],
+      "market_sell": [
+        731,
+        478
+      ],
+      "market_buy": [
+        948,
+        478
+      ],
+      "accept": [
+        839,
+        512
+      ],
+      "place": [
+        839,
+        512
+      ],
+      "buy_market": [
+        948,
+        478
+      ],
+      "sell_market": [
+        731,
+        478
+      ],
+      "position_context_close": [
+        270,
+        329
+      ]
+    },
+    "calibrated_resolution": [
+      1366,
+      768
+    ]
+  },
+  "coordinate_baseline": {
+    "resolution": [
+      1920,
+      1080
+    ],
     "order_form_coordinates": {
       "symbol": [
         1160,
@@ -229,6 +397,10 @@
         1008,
         668
       ]
-    }
+    },
+    "new_order_button": [
+      489,
+      59
+    ]
   }
 }

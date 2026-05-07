@@ -83,10 +83,34 @@ class PyAutoGuiExecutor:
             )
             return
 
+        before_tickets = self._destination_order_tickets()
         prepared = self.gui.prepare_pending_order(event.current)
+        time.sleep(self.gui.config.order_window_delay_seconds)
+        destination_ticket = self._find_new_destination_order_ticket(event.current, before_tickets)
+
+        if self.mapping_file is not None and destination_ticket is not None:
+            upsert_mapping(
+                self.mapping_file,
+                {
+                    "source_ticket": event.source_ticket,
+                    "destination_ticket": destination_ticket,
+                    "symbol": event.current.get("symbol", ""),
+                    "type": event.current.get("type", ""),
+                    "source_volume": event.current.get("volume_current", event.current.get("volume_initial", "")),
+                    "destination_volume": event.current.get("volume_current", event.current.get("volume_initial", "")),
+                    "status": "placed",
+                },
+            )
+        elif self.mapping_file is not None:
+            self.logger.error(
+                "ORDER_CREATED executed but destination ticket was not verified source_ticket=%s",
+                event.source_ticket,
+            )
+
         self.logger.info(
-            "ORDER_CREATED prepared source_ticket=%s symbol=%s type=%s volume=%s price=%s sl=%s tp=%s screenshot=%s",
+            "ORDER_CREATED prepared source_ticket=%s destination_ticket=%s symbol=%s type=%s volume=%s price=%s sl=%s tp=%s screenshot=%s",
             prepared["source_ticket"],
+            destination_ticket or "",
             prepared["symbol"],
             prepared["type"],
             prepared["volume"],
@@ -99,6 +123,15 @@ class PyAutoGuiExecutor:
     def _prepare_market_position(self, event: ChangeEvent) -> None:
         if not event.current:
             self.logger.warning("POSITION_OPENED event has no current row: %s", event.to_dict())
+            return
+
+        triggered_destination_ticket = self._adopt_triggered_pending_position(event)
+        if triggered_destination_ticket is not None:
+            self.logger.info(
+                "POSITION_OPENED adopted triggered pending order source_ticket=%s destination_ticket=%s",
+                event.source_ticket,
+                triggered_destination_ticket,
+            )
             return
 
         before_tickets = self._destination_position_tickets()
@@ -184,16 +217,34 @@ class PyAutoGuiExecutor:
             )
             return
 
-        screenshot = self.gui.close_position(destination_ticket, row_center=row_center)
+        screenshot = self.gui.close_position(
+            destination_ticket,
+            row_center=row_center,
+            trade_type=map_row.get("type", ""),
+        )
         time.sleep(self.gui.config.order_window_delay_seconds)
         if destination_ticket in self._destination_position_tickets():
-            self.logger.error(
-                "POSITION_CLOSED did not remove destination_ticket=%s source_ticket=%s screenshot=%s",
-                destination_ticket,
-                event.source_ticket,
-                screenshot,
-            )
-            return
+            fallback = getattr(self.gui, "close_position_from_context_menu", None)
+            if callable(fallback):
+                self.logger.warning(
+                    "POSITION_CLOSED primary close did not remove destination_ticket=%s; trying context menu close.",
+                    destination_ticket,
+                )
+                screenshot = fallback(
+                    destination_ticket,
+                    row_center=row_center,
+                    trade_type=map_row.get("type", ""),
+                )
+                time.sleep(self.gui.config.order_window_delay_seconds)
+
+            if destination_ticket in self._destination_position_tickets():
+                self.logger.error(
+                    "POSITION_CLOSED did not remove destination_ticket=%s source_ticket=%s screenshot=%s",
+                    destination_ticket,
+                    event.source_ticket,
+                    screenshot,
+                )
+                return
 
         updated = dict(map_row)
         updated["status"] = "closed"
@@ -287,6 +338,11 @@ class PyAutoGuiExecutor:
                 return row
         return None
 
+    def _destination_order_tickets(self) -> set[str]:
+        if self.destination_orders_file is None:
+            return set()
+        return {str(row.get("ticket", "")) for row in read_csv_rows(self.destination_orders_file)}
+
     def _log_unsupported_action(self, event: ChangeEvent) -> None:
         try:
             focused = self.gui.focus_mt5()
@@ -360,6 +416,105 @@ class PyAutoGuiExecutor:
                 return ticket
         return None
 
+    def _find_new_destination_order_ticket(
+        self,
+        source_order: dict[str, Any],
+        before_tickets: set[str],
+    ) -> str | None:
+        if self.destination_orders_file is None:
+            return None
+
+        for row in read_csv_rows(self.destination_orders_file):
+            ticket = str(row.get("ticket", ""))
+            if ticket in before_tickets:
+                continue
+            if not _order_field_mismatches(source_order, row):
+                return ticket
+        return None
+
+    def _adopt_triggered_pending_position(self, event: ChangeEvent) -> str | None:
+        if self.mapping_file is None or self.destination_orders_file is None or self.destination_positions_file is None:
+            return None
+
+        source_position = event.current or {}
+        mapping = load_mapping(self.mapping_file)
+        active_destination_positions = self._destination_position_rows()
+        active_destination_orders = self._destination_order_tickets()
+        used_destination_positions = {
+            str(row.get("destination_ticket", ""))
+            for row in mapping.values()
+            if row.get("status") == "placed" and _is_market_trade_type(row.get("type"))
+        }
+
+        for source_order_ticket, map_row in mapping.items():
+            if map_row.get("status") != "placed":
+                continue
+            if _is_market_trade_type(map_row.get("type")):
+                continue
+
+            destination_order_ticket = str(map_row.get("destination_ticket", ""))
+            if not destination_order_ticket or destination_order_ticket in active_destination_orders:
+                continue
+            if _pending_type_to_market_type(map_row.get("type")) != _normalize_compare_value(source_position.get("type")):
+                continue
+            if _normalize_compare_value(map_row.get("symbol")) != _normalize_compare_value(source_position.get("symbol")):
+                continue
+            if _normalize_compare_value(map_row.get("source_volume")) != _normalize_compare_value(source_position.get("volume")):
+                continue
+
+            destination_ticket = self._find_matching_unmapped_destination_position(
+                source_position,
+                active_destination_positions,
+                used_destination_positions,
+            )
+            if destination_ticket is None:
+                continue
+
+            pending_update = dict(map_row)
+            pending_update["status"] = "triggered"
+            upsert_mapping(self.mapping_file, pending_update)
+            upsert_mapping(
+                self.mapping_file,
+                {
+                    "source_ticket": event.source_ticket,
+                    "destination_ticket": destination_ticket,
+                    "symbol": source_position.get("symbol", ""),
+                    "type": source_position.get("type", ""),
+                    "source_volume": source_position.get("volume", ""),
+                    "destination_volume": source_position.get("volume", ""),
+                    "status": "placed",
+                },
+            )
+            self.logger.info(
+                "Mapped triggered pending source_order=%s destination_order=%s source_position=%s destination_position=%s",
+                source_order_ticket,
+                destination_order_ticket,
+                event.source_ticket,
+                destination_ticket,
+            )
+            return destination_ticket
+
+        return None
+
+    def _destination_position_rows(self) -> list[dict[str, Any]]:
+        if self.destination_positions_file is None:
+            return []
+        return read_csv_rows(self.destination_positions_file)
+
+    def _find_matching_unmapped_destination_position(
+        self,
+        source_position: dict[str, Any],
+        destination_rows: list[dict[str, Any]],
+        used_destination_positions: set[str],
+    ) -> str | None:
+        for row in destination_rows:
+            ticket = str(row.get("ticket", ""))
+            if ticket in used_destination_positions:
+                continue
+            if _position_matches_market_source(source_position, row):
+                return ticket
+        return None
+
 
 def _order_field_mismatches(
     source_row: dict[str, Any],
@@ -417,6 +572,15 @@ def _position_matches_market_source(
 
 def _is_market_trade_type(trade_type: Any) -> bool:
     return str(trade_type).strip().upper() in {"BUY", "SELL"}
+
+
+def _pending_type_to_market_type(trade_type: Any) -> str:
+    text = str(trade_type).strip().upper()
+    if text.startswith("BUY_"):
+        return "BUY"
+    if text.startswith("SELL_"):
+        return "SELL"
+    return text
 
 
 def gui_config_from_executor_settings(settings: dict[str, Any], project_root: Path) -> GuiConfig:

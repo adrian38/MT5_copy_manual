@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import queue
+import re
 import threading
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -15,15 +17,23 @@ class TelegramConfig:
     bot_token: str
     chat_id: str
     prefix: str = "MT5 COPY"
+    duplicate_window_seconds: float = 60.0
 
 
 class TelegramNotifier:
-    def __init__(self, config: TelegramConfig, on_error: Callable[[str], None] | None = None) -> None:
+    def __init__(
+        self,
+        config: TelegramConfig,
+        on_error: Callable[[str], None] | None = None,
+        time_func: Callable[[], float] = time.monotonic,
+    ) -> None:
         self.config = config
         self.queue: queue.Queue[str | None] = queue.Queue()
         self.worker: threading.Thread | None = None
         self.last_error: str = ""
         self.on_error = on_error
+        self.time_func = time_func
+        self.recent_messages: dict[str, float] = {}
 
     def start(self) -> None:
         if not self.config.enabled or not self.config.bot_token or not self.config.chat_id:
@@ -39,6 +49,8 @@ class TelegramNotifier:
 
     def send(self, message: str) -> None:
         if not self.config.enabled or not self.config.bot_token or not self.config.chat_id:
+            return
+        if not self._should_send(message):
             return
         self.queue.put(message)
 
@@ -74,6 +86,31 @@ class TelegramNotifier:
             return text
         return text[:3897] + "..."
 
+    def _should_send(self, message: str) -> bool:
+        window = float(self.config.duplicate_window_seconds)
+        if window <= 0:
+            return True
+
+        now = self.time_func()
+        cutoff = now - window
+        for key, timestamp in list(self.recent_messages.items()):
+            if timestamp < cutoff:
+                del self.recent_messages[key]
+
+        key = _notification_key(message)
+        if self.recent_messages.get(key, cutoff - 1) >= cutoff:
+            return False
+        self.recent_messages[key] = now
+        return True
+
+
+def _notification_key(message: str) -> str:
+    return re.sub(
+        r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} \| [A-Z]+ \| [^|]+ \| ",
+        "",
+        message,
+    )
+
 
 def telegram_config_from_settings(settings: dict) -> TelegramConfig:
     telegram = dict(settings.get("telegram", {}))
@@ -82,4 +119,5 @@ def telegram_config_from_settings(settings: dict) -> TelegramConfig:
         bot_token=str(telegram.get("bot_token", "")),
         chat_id=str(telegram.get("chat_id", "")),
         prefix=str(telegram.get("prefix", "MT5 COPY")),
+        duplicate_window_seconds=float(telegram.get("duplicate_window_seconds", 60.0)),
     )

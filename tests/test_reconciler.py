@@ -3,7 +3,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from src.mt5_copy.reconciler import find_order_discrepancies, find_position_discrepancies, reconcile_sl_tp
+from src.mt5_copy.reconciler import (
+    find_order_discrepancies,
+    find_position_discrepancies,
+    reconcile_positions_to_source_authority,
+    reconcile_sl_tp,
+)
 
 
 class ReconcilerTest(unittest.TestCase):
@@ -101,6 +106,145 @@ class ReconcilerTest(unittest.TestCase):
             self.assertEqual(gui.modified_positions, [("20", 1, 2, (253, 741))])
             self.assertEqual(gui.modified_orders, [])
             self.assertEqual([issue.issue_type for issue in remaining], ["position_sl_tp_mismatch"])
+
+    def test_reconcile_sl_tp_order_scope_modifies_pending_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source_positions = tmp_path / "source_positions.csv"
+            source_orders = tmp_path / "source_orders.csv"
+            destination_positions = tmp_path / "destination_positions.csv"
+            destination_orders = tmp_path / "destination_orders.csv"
+            mapping_file = tmp_path / "mapping.csv"
+
+            _write_rows(source_positions, ["ticket", "sl", "tp"], [])
+            _write_rows(
+                source_orders,
+                ["ticket", "symbol", "type", "volume_current", "price_open", "sl", "tp"],
+                [
+                    {
+                        "ticket": "1",
+                        "symbol": "XAUUSD",
+                        "type": "BUY_STOP",
+                        "volume_current": "0.01",
+                        "price_open": "100",
+                        "sl": "90",
+                        "tp": "120",
+                    }
+                ],
+            )
+            _write_rows(destination_positions, ["ticket", "sl", "tp"], [])
+            _write_rows(
+                destination_orders,
+                ["ticket", "symbol", "type", "volume_current", "price_open", "sl", "tp"],
+                [
+                    {
+                        "ticket": "2",
+                        "symbol": "XAUUSD",
+                        "type": "BUY_STOP",
+                        "volume_current": "0.01",
+                        "price_open": "100",
+                        "sl": "91",
+                        "tp": "121",
+                    }
+                ],
+            )
+            _write_rows(
+                mapping_file,
+                ["source_ticket", "destination_ticket", "symbol", "type", "source_volume", "destination_volume", "status"],
+                [
+                    {
+                        "source_ticket": "1",
+                        "destination_ticket": "2",
+                        "symbol": "XAUUSD",
+                        "type": "BUY_STOP",
+                        "source_volume": "0.01",
+                        "destination_volume": "0.01",
+                        "status": "placed",
+                    }
+                ],
+            )
+
+            class UpdatingOrderGui(FakeGui):
+                def modify_pending_order_sl_tp(self, destination_ticket, sl, tp):
+                    self.modified_orders.append((destination_ticket, sl, tp))
+                    _write_rows(
+                        destination_orders,
+                        ["ticket", "symbol", "type", "volume_current", "price_open", "sl", "tp"],
+                        [
+                            {
+                                "ticket": destination_ticket,
+                                "symbol": "XAUUSD",
+                                "type": "BUY_STOP",
+                                "volume_current": "0.01",
+                                "price_open": "100",
+                                "sl": str(sl),
+                                "tp": str(tp),
+                            }
+                        ],
+                    )
+                    return Path("order.png")
+
+            gui = UpdatingOrderGui()
+            remaining = reconcile_sl_tp(
+                source_positions,
+                source_orders,
+                destination_positions,
+                destination_orders,
+                mapping_file,
+                gui,
+                FakeLogger(),
+                max_retries=1,
+                verify_delay_seconds=0,
+                issue_scope="orders",
+            )
+
+            self.assertEqual(gui.modified_orders, [("2", 90, 120)])
+            self.assertEqual(gui.modified_positions, [])
+            self.assertEqual(remaining, [])
+
+    def test_position_authority_sync_closes_extra_with_trade_type(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source_positions = tmp_path / "source_positions.csv"
+            destination_positions = tmp_path / "destination_positions.csv"
+            mapping_file = tmp_path / "mapping.csv"
+
+            _write_rows(source_positions, ["ticket", "symbol", "type", "volume"], [])
+            _write_rows(
+                destination_positions,
+                ["ticket", "symbol", "type", "volume"],
+                [{"ticket": "99", "symbol": "XAUUSD", "type": "SELL", "volume": "0.01"}],
+            )
+            _write_rows(
+                mapping_file,
+                ["source_ticket", "destination_ticket", "symbol", "type", "source_volume", "destination_volume", "status"],
+                [],
+            )
+
+            class ClosingGui(FakeGui):
+                def __init__(self):
+                    super().__init__()
+                    self.closed_positions = []
+                    self.config.submit_orders = True
+
+                def close_position(self, destination_ticket, row_center=None, trade_type=None):
+                    self.closed_positions.append((destination_ticket, row_center, trade_type))
+                    _write_rows(destination_positions, ["ticket", "symbol", "type", "volume"], [])
+                    return Path("closed.png")
+
+            gui = ClosingGui()
+            report = reconcile_positions_to_source_authority(
+                source_positions,
+                destination_positions,
+                mapping_file,
+                gui,
+                FakeLogger(),
+                verify_delay_seconds=0,
+            )
+
+            self.assertEqual(gui.closed_positions, [("99", (253, 721), "SELL")])
+            self.assertEqual(report.deleted, 1)
+            self.assertEqual(report.skipped, [])
 
 
 if __name__ == "__main__":

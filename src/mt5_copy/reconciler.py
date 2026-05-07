@@ -309,7 +309,11 @@ def reconcile_positions_to_source_authority(
             continue
 
         logger.info("AUTHORITY_SYNC closing extra market position destination_ticket=%s", destination_ticket)
-        gui.close_position(destination_ticket, row_center=row_center)
+        gui.close_position(
+            destination_ticket,
+            row_center=row_center,
+            trade_type=str(destination.get("type", "")),
+        )
         time.sleep(verify_delay_seconds)
         if destination_ticket in {str(row.get("ticket", "")) for row in read_csv_rows(destination_positions_file)}:
             skipped.append(f"close_position:{destination_ticket}:still_present")
