@@ -321,7 +321,8 @@ class Mt5GuiController:
         screenshot_before = self.screenshot("before_position_opened")
         order_window = self.open_new_order_window()
         symbol_screenshot = self.select_symbol(str(position.get("symbol", "")))
-        market_mode_screenshot = self.switch_to_market_order_mode()
+        self.switch_to_market_execution_mode()
+        market_mode_screenshot = self.screenshot("market_order_mode")
         fields_screenshot = self.fill_market_position_fields(position)
         prepared = {
             "source_ticket": position.get("ticket", ""),
@@ -461,36 +462,77 @@ class Mt5GuiController:
         self.accept_active_dialog()
         return screenshot_path
 
-    def close_position(self, destination_ticket: str, row_center: tuple[int, int] | None = None) -> Path:
+    def close_position(
+        self,
+        destination_ticket: str,
+        row_center: tuple[int, int] | None = None,
+        trade_type: str | None = None,
+    ) -> Path:
         self._require_armed("close position")
-        self.close_active_dialog()
-        self.focus_mt5()
-
         if row_center is None:
             screenshot_path = self.screenshot("position_close_ticket_not_found")
             raise GuiSafetyError(
                 f"Destination position ticket {destination_ticket} has no verified row center. Screenshot: {screenshot_path}"
             )
-
-        coordinates = self.config.order_form_coordinates
-        close_x = coordinates.get("position_close_x", (1892, row_center[1]))[0]
-        close_point = self._clamp_point_to_screen((close_x, row_center[1]))
-        self.pyautogui.click(*close_point)
-        time.sleep(self.config.order_window_delay_seconds)
-        screenshot_path = self.screenshot("after_position_close_clicked")
-        if self._accept_one_click_terms_if_open():
-            self.focus_mt5()
-            self.pyautogui.click(*close_point)
-            time.sleep(self.config.order_window_delay_seconds)
-            screenshot_path = self.screenshot("after_position_close_clicked")
-        self.logger.info(
-            "Closed position click destination_ticket=%s point=%s screenshot=%s",
+        return self.close_position_from_context_menu(
             destination_ticket,
-            close_point,
+            row_center=row_center,
+            trade_type=trade_type,
+        )
+
+    def close_position_from_context_menu(
+        self,
+        destination_ticket: str,
+        row_center: tuple[int, int] | None = None,
+        trade_type: str | None = None,
+    ) -> Path:
+        self._require_armed("close position from context menu")
+        self.close_active_dialog()
+        self.focus_mt5()
+        if row_center is not None:
+            self.pyautogui.rightClick(*self._clamp_point_to_screen(row_center))
+        elif not self._right_click_ticket_row(destination_ticket):
+            screenshot_path = self.screenshot("position_context_close_ticket_not_found")
+            raise GuiSafetyError(
+                f"Destination position ticket {destination_ticket} was not visible for context close. "
+                f"Screenshot: {screenshot_path}"
+            )
+
+        time.sleep(self.config.field_delay_seconds)
+        self.pyautogui.press("down", presses=2)
+        self.pyautogui.press("enter")
+        time.sleep(self.config.order_window_delay_seconds)
+        if self._trade_dialog_is_open():
+            self._submit_position_close_dialog(trade_type)
+        screenshot_path = self.screenshot("after_position_context_close_clicked")
+        self.logger.info(
+            "Closed position from context menu destination_ticket=%s screenshot=%s",
+            destination_ticket,
             screenshot_path,
         )
         self.accept_active_dialog()
         return screenshot_path
+
+    def _submit_position_close_dialog(self, trade_type: str | None) -> None:
+        coordinates = self.config.order_form_coordinates
+        trade_type_upper = str(trade_type or "").strip().upper()
+        if trade_type_upper == "BUY":
+            button_key = "market_sell"
+        elif trade_type_upper == "SELL":
+            button_key = "market_buy"
+        else:
+            button_key = ""
+
+        self.pyautogui.press("enter")
+        time.sleep(self.config.order_window_delay_seconds)
+        if not self._trade_dialog_is_open():
+            return
+
+        if button_key and button_key in coordinates:
+            self.pyautogui.click(*coordinates[button_key])
+        else:
+            self.pyautogui.press("enter")
+        time.sleep(self.config.order_window_delay_seconds)
 
     def _accept_one_click_terms_if_open(self) -> bool:
         if not self._dialog_title_is_open("Trading con un clic"):
@@ -565,14 +607,11 @@ class Mt5GuiController:
             raise GuiSafetyError(
                 f"Destination position ticket {destination_ticket} was not visible in toolbox. "
                 f"Screenshot: {screenshot_path}"
-            )
-
-        coordinates = self.config.order_form_coordinates
-        if "position_context_modify" not in coordinates:
-            raise GuiSafetyError("Missing coordinates for position field: position_context_modify")
+        )
 
         time.sleep(self.config.field_delay_seconds)
-        self.pyautogui.click(*coordinates["position_context_modify"])
+        self.pyautogui.press("down", presses=2)
+        self.pyautogui.press("enter")
         time.sleep(self.config.order_window_delay_seconds)
         if not self._trade_dialog_is_open():
             screenshot_path = self.screenshot("modify_position_not_open")

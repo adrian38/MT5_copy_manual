@@ -6,3 +6,4 @@ logs/*.log.*
 data/state/*.json
 data/state/*.tmp
 data/screenshots/*.png
+dist

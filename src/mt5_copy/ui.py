@@ -72,6 +72,51 @@ class QueueLogHandler(logging.Handler):
         return any(pattern in message for pattern in self.EVENT_PATTERNS)
 
 
+def apply_automatic_coordinate_calibration(
+    raw: dict[str, Any],
+    current_w: int,
+    current_h: int,
+) -> tuple[int, int, float, float]:
+    origin_w, origin_h = 1920, 1080
+    executor = raw.setdefault("executor", {})
+
+    if "coordinate_baseline" not in raw:
+        raw["coordinate_baseline"] = {
+            "resolution": [origin_w, origin_h],
+            "order_form_coordinates": executor.get("order_form_coordinates", {}),
+            "new_order_button": executor.get("new_order_button"),
+        }
+
+    baseline = raw["coordinate_baseline"]
+    base_w, base_h = (int(part) for part in baseline.get("resolution", [origin_w, origin_h]))
+    if base_w <= 0 or base_h <= 0:
+        base_w, base_h = origin_w, origin_h
+        baseline["resolution"] = [base_w, base_h]
+
+    scale_x = current_w / base_w
+    scale_y = current_h / base_h
+
+    non_coord = {"order_scan_rows"}
+    new_coords: dict[str, Any] = {}
+    for key, val in dict(baseline.get("order_form_coordinates", {})).items():
+        if key in non_coord or not isinstance(val, list) or len(val) != 2:
+            new_coords[key] = val
+        else:
+            new_coords[key] = [round(float(val[0]) * scale_x), round(float(val[1]) * scale_y)]
+
+    executor["order_form_coordinates"] = new_coords
+
+    base_btn = baseline.get("new_order_button")
+    if isinstance(base_btn, list) and len(base_btn) == 2:
+        executor["new_order_button"] = [
+            round(float(base_btn[0]) * scale_x),
+            round(float(base_btn[1]) * scale_y),
+        ]
+
+    executor["calibrated_resolution"] = [current_w, current_h]
+    return base_w, base_h, scale_x, scale_y
+
+
 class CopyMonitorApp:
     def __init__(self, root: tk.Tk, config_path: Path = DEFAULT_CONFIG_PATH) -> None:
         self.root = root
@@ -456,9 +501,6 @@ class CopyMonitorApp:
         self.logger.info("Notificaciones Telegram %s", estado)
 
     def _calibrate_coordinates(self) -> None:
-        # Resolution the bundled coordinates were designed for
-        _ORIGIN_W, _ORIGIN_H = 1920, 1080
-
         try:
             import pyautogui as _pag
             current_w, current_h = _pag.size()
@@ -469,21 +511,16 @@ class CopyMonitorApp:
         with self.config_path.open("r", encoding="utf-8") as fh:
             raw = json.load(fh)
 
+        base_w, base_h, scale_x, scale_y = apply_automatic_coordinate_calibration(
+            raw,
+            int(current_w),
+            int(current_h),
+        )
         executor = raw.setdefault("executor", {})
-
-        # Initialize baseline the first time, always anchored to the original 1920x1080
-        if "coordinate_baseline" not in raw:
-            raw["coordinate_baseline"] = {
-                "resolution": [_ORIGIN_W, _ORIGIN_H],
-                "order_form_coordinates": executor.get("order_form_coordinates", {}),
-                "new_order_button": executor.get("new_order_button"),
-            }
-
         baseline = raw["coordinate_baseline"]
-        base_w, base_h = baseline["resolution"]
 
         if base_w == current_w and base_h == current_h:
-            # Also save baseline if it was just created
+            # Save the rebuilt executor coordinates even when the scale is 1:1.
             with self.config_path.open("w", encoding="utf-8") as fh:
                 json.dump(raw, fh, indent=2)
                 fh.write("\n")
