@@ -12,15 +12,39 @@ class FakeGui:
         self.config = type(
             "Config",
             (),
-            {"order_form_coordinates": {"order_row_anchor": (253, 741), "order_row_step_y": (0, 20)}},
+            {
+                "order_form_coordinates": {"order_row_anchor": (253, 741), "order_row_step_y": (0, 20)},
+                "order_window_delay_seconds": 0,
+            },
         )()
         self.deleted_tickets = []
         self.row_centers = []
+        self.closed_positions = []
+        self.position_row_centers = []
+        self.prepared_pending_orders = []
 
     def delete_pending_order(self, destination_ticket: str, row_center=None):
         self.deleted_tickets.append(destination_ticket)
         self.row_centers.append(row_center)
         return Path("screenshot.png")
+
+    def prepare_pending_order(self, order):
+        self.prepared_pending_orders.append(order)
+        return {
+            "source_ticket": order.get("ticket", ""),
+            "symbol": order.get("symbol", ""),
+            "type": order.get("type", ""),
+            "volume": order.get("volume_current", order.get("volume_initial", "")),
+            "price_open": order.get("price_open", ""),
+            "sl": order.get("sl", ""),
+            "tp": order.get("tp", ""),
+            "screenshot_order_window": "pending.png",
+        }
+
+    def close_position(self, destination_ticket: str, row_center=None):
+        self.closed_positions.append(destination_ticket)
+        self.position_row_centers.append(row_center)
+        return Path("position_closed.png")
 
 
 class FakeLogger:
@@ -28,6 +52,9 @@ class FakeLogger:
         pass
 
     def warning(self, *args, **kwargs):
+        pass
+
+    def error(self, *args, **kwargs):
         pass
 
 
@@ -254,6 +281,230 @@ class ExecutorTest(unittest.TestCase):
             )
 
             self.assertEqual(gui.row_centers, [(253, 761)])
+
+    def test_position_opened_maps_verified_market_position(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mapping_file = Path(tmp) / "mapping.csv"
+            destination_positions_file = Path(tmp) / "destination_positions.csv"
+            with destination_positions_file.open("w", encoding="utf-8", newline="") as fh:
+                writer = csv.DictWriter(
+                    fh,
+                    fieldnames=["ticket", "symbol", "type", "volume", "price_open", "sl", "tp"],
+                )
+                writer.writeheader()
+
+            class MarketGui(FakeGui):
+                def prepare_market_position(self, position):
+                    with destination_positions_file.open("a", encoding="utf-8", newline="") as fh:
+                        writer = csv.DictWriter(
+                            fh,
+                            fieldnames=["ticket", "symbol", "type", "volume", "price_open", "sl", "tp"],
+                        )
+                        writer.writerow(
+                            {
+                                "ticket": "99",
+                                "symbol": position["symbol"],
+                                "type": position["type"],
+                                "volume": position["volume"],
+                                "price_open": "4745.12",
+                                "sl": position["sl"],
+                                "tp": position["tp"],
+                            }
+                        )
+                    return {
+                        "source_ticket": position["ticket"],
+                        "symbol": position["symbol"],
+                        "type": position["type"],
+                        "volume": position["volume"],
+                        "sl": position["sl"],
+                        "tp": position["tp"],
+                        "screenshot_order_window": "screenshot.png",
+                    }
+
+            executor = PyAutoGuiExecutor(
+                MarketGui(),
+                FakeLogger(),
+                mapping_file=mapping_file,
+                destination_positions_file=destination_positions_file,
+            )
+            executor.handle(
+                ChangeEvent(
+                    change_type=ChangeType.POSITION_OPENED,
+                    source_ticket="42",
+                    symbol="XAUUSD",
+                    trade_type="BUY",
+                    previous=None,
+                    current={
+                        "ticket": "42",
+                        "symbol": "XAUUSD",
+                        "type": "BUY",
+                        "volume": "0.01",
+                        "price_open": "4686.09",
+                        "sl": "0.00",
+                        "tp": "0.00",
+                    },
+                    changed_fields={},
+                )
+            )
+
+            with mapping_file.open("r", encoding="utf-8", newline="") as fh:
+                rows = list(csv.DictReader(fh))
+            self.assertEqual(rows[0]["source_ticket"], "42")
+            self.assertEqual(rows[0]["destination_ticket"], "99")
+            self.assertEqual(rows[0]["type"], "BUY")
+
+    def test_position_closed_closes_destination_and_updates_mapping(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mapping_file = Path(tmp) / "mapping.csv"
+            with mapping_file.open("w", encoding="utf-8", newline="") as fh:
+                writer = csv.DictWriter(
+                    fh,
+                    fieldnames=[
+                        "source_ticket",
+                        "destination_ticket",
+                        "symbol",
+                        "type",
+                        "source_volume",
+                        "destination_volume",
+                        "status",
+                    ],
+                )
+                writer.writeheader()
+                writer.writerow(
+                    {
+                        "source_ticket": "42",
+                        "destination_ticket": "99",
+                        "symbol": "XAUUSD",
+                        "type": "BUY",
+                        "source_volume": "0.01",
+                        "destination_volume": "0.01",
+                        "status": "placed",
+                    }
+                )
+
+            destination_positions_file = Path(tmp) / "destination_positions.csv"
+            with destination_positions_file.open("w", encoding="utf-8", newline="") as fh:
+                writer = csv.DictWriter(fh, fieldnames=["ticket", "symbol", "type", "volume"])
+                writer.writeheader()
+                writer.writerow({"ticket": "99", "symbol": "XAUUSD", "type": "BUY", "volume": "0.01"})
+
+            class ClosingGui(FakeGui):
+                def close_position(self, destination_ticket: str, row_center=None):
+                    self.closed_positions.append(destination_ticket)
+                    self.position_row_centers.append(row_center)
+                    with destination_positions_file.open("w", encoding="utf-8", newline="") as out_fh:
+                        writer = csv.DictWriter(out_fh, fieldnames=["ticket", "symbol", "type", "volume"])
+                        writer.writeheader()
+                    return Path("position_closed.png")
+
+            gui = ClosingGui()
+            executor = PyAutoGuiExecutor(
+                gui,
+                FakeLogger(),
+                mapping_file=mapping_file,
+                destination_positions_file=destination_positions_file,
+            )
+            executor.handle(
+                ChangeEvent(
+                    change_type=ChangeType.POSITION_CLOSED,
+                    source_ticket="42",
+                    symbol="XAUUSD",
+                    trade_type="BUY",
+                    previous={"ticket": "42", "symbol": "XAUUSD", "type": "BUY", "volume": "0.01"},
+                    current=None,
+                    changed_fields={},
+                )
+            )
+
+            self.assertEqual(gui.closed_positions, ["99"])
+            self.assertEqual(gui.position_row_centers, [(253, 721)])
+            with mapping_file.open("r", encoding="utf-8", newline="") as fh:
+                rows = list(csv.DictReader(fh))
+            self.assertEqual(rows[0]["status"], "closed")
+
+    def test_position_closed_refuses_when_destination_row_is_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mapping_file = Path(tmp) / "mapping.csv"
+            with mapping_file.open("w", encoding="utf-8", newline="") as fh:
+                writer = csv.DictWriter(
+                    fh,
+                    fieldnames=[
+                        "source_ticket",
+                        "destination_ticket",
+                        "symbol",
+                        "type",
+                        "source_volume",
+                        "destination_volume",
+                        "status",
+                    ],
+                )
+                writer.writeheader()
+                writer.writerow(
+                    {
+                        "source_ticket": "42",
+                        "destination_ticket": "99",
+                        "symbol": "XAUUSD",
+                        "type": "BUY",
+                        "source_volume": "0.01",
+                        "destination_volume": "0.01",
+                        "status": "placed",
+                    }
+                )
+
+            destination_positions_file = Path(tmp) / "destination_positions.csv"
+            with destination_positions_file.open("w", encoding="utf-8", newline="") as fh:
+                writer = csv.DictWriter(fh, fieldnames=["ticket", "symbol", "type", "volume"])
+                writer.writeheader()
+                writer.writerow({"ticket": "88", "symbol": "XAUUSD", "type": "SELL", "volume": "0.01"})
+
+            gui = FakeGui()
+            executor = PyAutoGuiExecutor(
+                gui,
+                FakeLogger(),
+                mapping_file=mapping_file,
+                destination_positions_file=destination_positions_file,
+            )
+            executor.handle(
+                ChangeEvent(
+                    change_type=ChangeType.POSITION_CLOSED,
+                    source_ticket="42",
+                    symbol="XAUUSD",
+                    trade_type="BUY",
+                    previous={"ticket": "42", "symbol": "XAUUSD", "type": "BUY", "volume": "0.01"},
+                    current=None,
+                    changed_fields={},
+                )
+            )
+
+            self.assertEqual(gui.closed_positions, [])
+            with mapping_file.open("r", encoding="utf-8", newline="") as fh:
+                rows = list(csv.DictReader(fh))
+            self.assertEqual(rows[0]["status"], "closed")
+
+    def test_market_order_created_is_ignored_as_transient_order_row(self):
+        gui = FakeGui()
+        executor = PyAutoGuiExecutor(gui, FakeLogger())
+        executor.handle(
+            ChangeEvent(
+                change_type=ChangeType.ORDER_CREATED,
+                source_ticket="42",
+                symbol="XAUUSD",
+                trade_type="BUY",
+                previous=None,
+                current={
+                    "ticket": "42",
+                    "symbol": "XAUUSD",
+                    "type": "BUY",
+                    "volume_current": "0.01",
+                    "price_open": "4700",
+                    "sl": "0",
+                    "tp": "0",
+                },
+                changed_fields={},
+            )
+        )
+
+        self.assertEqual(gui.prepared_pending_orders, [])
 
 
 if __name__ == "__main__":

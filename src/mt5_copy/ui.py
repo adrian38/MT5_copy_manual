@@ -8,7 +8,7 @@ import time
 import tkinter as tk
 from dataclasses import dataclass
 from pathlib import Path
-from tkinter import ttk
+from tkinter import messagebox, ttk
 from typing import Any
 
 from .app import run_once
@@ -103,6 +103,7 @@ class CopyMonitorApp:
         self.destination_state_var = tk.StringVar(value="-")
         self.last_scan_var = tk.StringVar(value="-")
         self.last_events_var = tk.StringVar(value="0")
+        self.poll_seconds_var = tk.StringVar(value=f"{self.config.poll_seconds:.1f}")
         self.error_var = tk.StringVar(value="")
         self.executor_var = tk.StringVar(value=self._executor_text())
         self.source_terminal_var = tk.StringVar(value=str(self.config.terminals.get("source_terminal_id", "")))
@@ -116,6 +117,7 @@ class CopyMonitorApp:
         self.destination_window_var = tk.StringVar(
             value=str(self.config.executor.get("mt5_window_title_contains", ""))
         )
+        self.common_files_var = tk.StringVar(value=str(self.config.common_files_path))
 
         self._install_tk_exception_handler()
         self._build_ui()
@@ -127,8 +129,12 @@ class CopyMonitorApp:
 
     def start(self) -> None:
         if self.worker and self.worker.is_alive():
+            if self.stop_event.is_set():
+                self._set_mode("DETENIENDO")
+                self.logger.warning("Tracking start ignored because stop is still in progress.")
+                return
             self.pause_event.clear()
-            self.mode_var.set("ACTIVO")
+            self._set_mode("ACTIVO")
             self.logger.info("Tracking resumed from UI.")
             return
 
@@ -136,18 +142,24 @@ class CopyMonitorApp:
         self.pause_event.clear()
         self.worker = threading.Thread(target=self._worker_loop, name="copy-monitor", daemon=True)
         self.worker.start()
-        self.mode_var.set("ACTIVO")
+        self._set_mode("ACTIVO")
         self.logger.info("Tracking started from UI.")
 
     def pause(self) -> None:
+        if self.stop_event.is_set():
+            self._set_mode("DETENIENDO")
+            return
         self.pause_event.set()
-        self.mode_var.set("PAUSADO")
+        self._set_mode("PAUSADO")
         self.logger.info("Tracking paused from UI.")
 
     def stop(self) -> None:
         self.stop_event.set()
         self.pause_event.set()
-        self.mode_var.set("DETENIENDO")
+        if self.worker and self.worker.is_alive():
+            self._set_mode("DETENIENDO")
+        else:
+            self._set_mode("DETENIDO")
         self.logger.info("Tracking stop requested from UI.")
 
     def _build_ui(self) -> None:
@@ -175,6 +187,14 @@ class CopyMonitorApp:
         ttk.Button(controls, text="Guardar terminales", command=lambda: self._safe_ui_call(self._save_terminal_settings)).grid(
             row=0, column=4, padx=(8, 0)
         )
+        ttk.Button(controls, text="Calibrar pantalla", command=lambda: self._safe_ui_call(self._calibrate_coordinates)).grid(
+            row=0, column=5, padx=(8, 0)
+        )
+        self.telegram_btn = ttk.Button(
+            controls, text=self._telegram_btn_text(),
+            command=lambda: self._safe_ui_call(self._toggle_telegram),
+        )
+        self.telegram_btn.grid(row=0, column=6, padx=(8, 0))
 
         routing = ttk.LabelFrame(self.root, text="Ruta de copia", padding=10)
         routing.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 10))
@@ -205,6 +225,11 @@ class CopyMonitorApp:
         ttk.Label(routing, text="Prefijo destino").grid(row=2, column=2, sticky="w", padx=(0, 6), pady=(8, 0))
         ttk.Entry(routing, textvariable=self.destination_prefix_var).grid(row=2, column=3, sticky="ew", pady=(8, 0))
 
+        ttk.Label(routing, text="Common Files MT5").grid(row=3, column=0, sticky="w", padx=(0, 6), pady=(8, 0))
+        ttk.Entry(routing, textvariable=self.common_files_var).grid(
+            row=3, column=1, columnspan=3, sticky="ew", pady=(8, 0)
+        )
+
         self.source_combo.bind("<<ComboboxSelected>>", lambda _event: self._load_terminal_fields())
         self.destination_combo.bind("<<ComboboxSelected>>", lambda _event: self._load_terminal_fields())
 
@@ -227,8 +252,14 @@ class CopyMonitorApp:
         ttk.Label(summary, textvariable=self.last_scan_var).grid(row=0, column=1, sticky="w", padx=(6, 18))
         ttk.Label(summary, text="Eventos detectados:").grid(row=0, column=2, sticky="w")
         ttk.Label(summary, textvariable=self.last_events_var).grid(row=0, column=3, sticky="w", padx=(6, 18))
+        ttk.Label(summary, text="Periodicidad:").grid(row=0, column=4, sticky="w")
+        poll_entry = ttk.Entry(summary, textvariable=self.poll_seconds_var, width=7)
+        poll_entry.grid(row=0, column=5, sticky="w", padx=(6, 2))
+        poll_entry.bind("<Return>", lambda _e: self._safe_ui_call(self._save_poll_seconds))
+        poll_entry.bind("<FocusOut>", lambda _e: self._safe_ui_call(self._save_poll_seconds))
+        ttk.Label(summary, text="s").grid(row=0, column=6, sticky="w", padx=(0, 18))
         ttk.Label(summary, textvariable=self.error_var, foreground="#9a3412").grid(
-            row=0, column=4, sticky="w"
+            row=0, column=7, sticky="w"
         )
 
         log_frame = ttk.LabelFrame(body, text="Actividad de cambios", padding=8)
@@ -256,9 +287,10 @@ class CopyMonitorApp:
 
     def _worker_loop(self) -> None:
         while not self.stop_event.is_set():
-            if self.pause_event.is_set():
+            while self.pause_event.is_set() and not self.stop_event.is_set():
                 time.sleep(0.25)
-                continue
+            if self.stop_event.is_set():
+                break
 
             try:
                 events = run_once(self.config_path)
@@ -271,9 +303,17 @@ class CopyMonitorApp:
 
             sleep_until = time.monotonic() + self.config.poll_seconds
             while time.monotonic() < sleep_until and not self.stop_event.is_set():
+                if self.pause_event.is_set():
+                    break
                 time.sleep(0.1)
 
-        self.mode_var.set("DETENIDO")
+        self._set_mode("DETENIDO")
+
+    def _set_mode(self, value: str) -> None:
+        if threading.current_thread() is threading.main_thread():
+            self.mode_var.set(value)
+        else:
+            self.root.after(0, self.mode_var.set, value)
 
     def _refresh_status(self) -> None:
         try:
@@ -302,6 +342,7 @@ class CopyMonitorApp:
         self.last_events_var.set(str(self.last_scan_events))
         self.error_var.set(self.scan_error)
         self.executor_var.set(self._executor_text())
+        self.telegram_btn.config(text=self._telegram_btn_text())
 
         self.root.after(1000, lambda: self._safe_ui_call(self._refresh_status))
 
@@ -339,6 +380,10 @@ class CopyMonitorApp:
         executor = raw.setdefault("executor", {})
         executor["mt5_window_title_contains"] = self.destination_window_var.get().strip()
 
+        common_files = self.common_files_var.get().strip()
+        if common_files:
+            raw["common_files_path"] = common_files
+
         with self.config_path.open("w", encoding="utf-8") as fh:
             json.dump(raw, fh, indent=2)
             fh.write("\n")
@@ -346,10 +391,11 @@ class CopyMonitorApp:
         self.config = load_config(self.config_path)
         self.executor_var.set(self._executor_text())
         self.logger.info(
-            "Terminal route saved: source=%s destination=%s window_id=%s",
+            "Terminal route saved: source=%s destination=%s window_id=%s common_files=%s",
             terminals["source_terminal_id"],
             terminals["destination_terminal_id"],
             executor["mt5_window_title_contains"],
+            common_files,
         )
         self._refresh_status()
 
@@ -379,6 +425,134 @@ class CopyMonitorApp:
                 "enabled": True,
             }
         )
+
+    def _telegram_btn_text(self) -> str:
+        enabled = self.config.notifications.get("telegram", {}).get("enabled", False)
+        return "Telegram: ON" if enabled else "Telegram: OFF"
+
+    def _toggle_telegram(self) -> None:
+        with self.config_path.open("r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+
+        telegram = raw.setdefault("notifications", {}).setdefault("telegram", {})
+        new_state = not bool(telegram.get("enabled", False))
+        telegram["enabled"] = new_state
+
+        with self.config_path.open("w", encoding="utf-8") as fh:
+            json.dump(raw, fh, indent=2)
+            fh.write("\n")
+
+        self.config = load_config(self.config_path)
+
+        self.telegram.stop()
+        self.telegram = TelegramNotifier(
+            telegram_config_from_settings(self.config.notifications),
+            on_error=self.telegram_error_queue.put,
+        )
+        self.telegram.start()
+
+        self.telegram_btn.config(text=self._telegram_btn_text())
+        estado = "activadas" if new_state else "desactivadas"
+        self.logger.info("Notificaciones Telegram %s", estado)
+
+    def _calibrate_coordinates(self) -> None:
+        try:
+            import pyautogui as _pag
+            current_w, current_h = _pag.size()
+        except Exception:
+            current_w = self.root.winfo_screenwidth()
+            current_h = self.root.winfo_screenheight()
+
+        with self.config_path.open("r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+
+        executor = raw.setdefault("executor", {})
+
+        if "coordinate_baseline" not in raw:
+            raw["coordinate_baseline"] = {
+                "resolution": [current_w, current_h],
+                "order_form_coordinates": executor.get("order_form_coordinates", {}),
+                "new_order_button": executor.get("new_order_button"),
+            }
+            with self.config_path.open("w", encoding="utf-8") as fh:
+                json.dump(raw, fh, indent=2)
+                fh.write("\n")
+            messagebox.showinfo(
+                "Calibrar pantalla",
+                f"Baseline guardado para {current_w}x{current_h}.\n"
+                "Esta resolución se usará como referencia para futuras calibraciones.",
+            )
+            return
+
+        baseline = raw["coordinate_baseline"]
+        base_w, base_h = baseline["resolution"]
+
+        if base_w == current_w and base_h == current_h:
+            messagebox.showinfo(
+                "Calibrar pantalla",
+                f"Las coordenadas ya están calibradas para {current_w}x{current_h}.",
+            )
+            return
+
+        scale_x = current_w / base_w
+        scale_y = current_h / base_h
+        if not messagebox.askyesno(
+            "Calibrar pantalla",
+            f"Pantalla detectada: {current_w}x{current_h}\n"
+            f"Baseline: {base_w}x{base_h}\n"
+            f"Factor X: {scale_x:.4f}  |  Factor Y: {scale_y:.4f}\n\n"
+            "¿Aplicar reescalado a todas las coordenadas?",
+        ):
+            return
+
+        _NON_COORD = {"order_scan_rows"}
+        new_coords: dict[str, Any] = {}
+        for key, val in baseline.get("order_form_coordinates", {}).items():
+            if key in _NON_COORD or not isinstance(val, list) or len(val) != 2:
+                new_coords[key] = val
+            else:
+                new_coords[key] = [round(val[0] * scale_x), round(val[1] * scale_y)]
+
+        executor["order_form_coordinates"] = new_coords
+
+        base_btn = baseline.get("new_order_button")
+        if isinstance(base_btn, list) and len(base_btn) == 2:
+            executor["new_order_button"] = [round(base_btn[0] * scale_x), round(base_btn[1] * scale_y)]
+
+        with self.config_path.open("w", encoding="utf-8") as fh:
+            json.dump(raw, fh, indent=2)
+            fh.write("\n")
+
+        self.config = load_config(self.config_path)
+        self.logger.info(
+            "Coordinates calibrated %sx%s → %sx%s scale_x=%.4f scale_y=%.4f",
+            base_w, base_h, current_w, current_h, scale_x, scale_y,
+        )
+        messagebox.showinfo(
+            "Calibrar pantalla",
+            f"Coordenadas actualizadas para {current_w}x{current_h}.",
+        )
+
+    def _save_poll_seconds(self) -> None:
+        try:
+            value = float(self.poll_seconds_var.get().replace(",", "."))
+        except ValueError:
+            self.poll_seconds_var.set(f"{self.config.poll_seconds:.1f}")
+            return
+        if value <= 0:
+            self.poll_seconds_var.set(f"{self.config.poll_seconds:.1f}")
+            return
+
+        with self.config_path.open("r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+        raw["poll_seconds"] = value
+        with self.config_path.open("w", encoding="utf-8") as fh:
+            json.dump(raw, fh, indent=2)
+            fh.write("\n")
+
+        self.config = load_config(self.config_path)
+        self.poll_seconds_var.set(f"{self.config.poll_seconds:.1f}")
+        self.logger.info("poll_seconds updated to %s", value)
 
     def _drain_logs(self) -> None:
         while True:

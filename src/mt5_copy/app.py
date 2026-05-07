@@ -18,7 +18,11 @@ if __package__ in {None, ""}:
     from src.mt5_copy.logging_setup import setup_logging
     from src.mt5_copy.mapping import ensure_mapping_file
     from src.mt5_copy.models import ChangeEvent, ChangeType
-    from src.mt5_copy.reconciler import reconcile_orders_to_source_authority, reconcile_sl_tp
+    from src.mt5_copy.reconciler import (
+        reconcile_orders_to_source_authority,
+        reconcile_positions_to_source_authority,
+        reconcile_sl_tp,
+    )
     from src.mt5_copy.state import load_state, save_state
 else:
     from .config import PROJECT_ROOT
@@ -30,7 +34,11 @@ else:
     from .logging_setup import setup_logging
     from .mapping import ensure_mapping_file
     from .models import ChangeEvent, ChangeType
-    from .reconciler import reconcile_orders_to_source_authority, reconcile_sl_tp
+    from .reconciler import (
+        reconcile_orders_to_source_authority,
+        reconcile_positions_to_source_authority,
+        reconcile_sl_tp,
+    )
     from .state import load_state, save_state
 
 
@@ -38,6 +46,7 @@ def run_once(
     config_path: Path = DEFAULT_CONFIG_PATH,
     replay_current_orders: bool = False,
     replay_limit: int | None = None,
+    authority_sync_scope: str = "auto",
 ) -> int:
     config = load_config(config_path)
     logger = setup_logging(config.app_log_file, config.log_level)
@@ -83,6 +92,7 @@ def run_once(
         project_root=PROJECT_ROOT,
         mapping_file=config.mapping_file,
         destination_orders_file=config.destination_orders_file,
+        destination_positions_file=config.destination_positions_file,
     )
 
     for event in events:
@@ -98,18 +108,56 @@ def run_once(
     if (
         str(config.executor.get("mode", "dry_run")) == "pyautogui"
         and bool(config.executor.get("pyautogui_enabled", False))
+    ):
+        sl_tp_scope = _sl_tp_reconcile_scope(events)
+        if sl_tp_scope is not None:
+            gui = build_gui_controller(config.executor, PROJECT_ROOT, logger)
+            remaining = reconcile_sl_tp(
+                source_positions_file=config.positions_file,
+                source_orders_file=config.orders_file,
+                destination_positions_file=config.destination_positions_file,
+                destination_orders_file=config.destination_orders_file,
+                mapping_file=config.mapping_file,
+                gui=gui,
+                logger=logger,
+                issue_scope=sl_tp_scope,
+            )
+            if remaining:
+                logger.warning("SL/TP reconcile remaining scope=%s issues=%s", sl_tp_scope, remaining)
+
+    if (
+        str(config.executor.get("mode", "dry_run")) == "pyautogui"
+        and bool(config.executor.get("pyautogui_enabled", False))
         and bool(config.executor.get("authority_sync_enabled", False))
     ):
         gui = build_gui_controller(config.executor, PROJECT_ROOT, logger)
-        report = reconcile_orders_to_source_authority(
-            source_orders_file=config.orders_file,
-            destination_orders_file=config.destination_orders_file,
-            mapping_file=config.mapping_file,
-            gui=gui,
-            logger=logger,
-        )
-        if report.created or report.deleted or report.skipped or report.missing_sources or report.extra_destinations:
-            logger.info("AUTHORITY_SYNC report=%s", report)
+        run_order_sync, run_position_sync = _authority_sync_flags(events, authority_sync_scope)
+        if run_order_sync:
+            report = reconcile_orders_to_source_authority(
+                source_orders_file=config.orders_file,
+                destination_orders_file=config.destination_orders_file,
+                mapping_file=config.mapping_file,
+                gui=gui,
+                logger=logger,
+            )
+            if report.created or report.deleted or report.skipped or report.missing_sources or report.extra_destinations:
+                logger.info("AUTHORITY_SYNC report=%s", report)
+        if run_position_sync:
+            position_report = reconcile_positions_to_source_authority(
+                source_positions_file=config.positions_file,
+                destination_positions_file=config.destination_positions_file,
+                mapping_file=config.mapping_file,
+                gui=gui,
+                logger=logger,
+            )
+            if (
+                position_report.created
+                or position_report.deleted
+                or position_report.skipped
+                or position_report.missing_sources
+                or position_report.extra_destinations
+            ):
+                logger.info("AUTHORITY_SYNC positions report=%s", position_report)
 
     save_state(config.state_file, positions, orders)
     logger.info(
@@ -120,6 +168,44 @@ def run_once(
         heartbeat,
     )
     return len(events)
+
+
+def _authority_sync_flags(events: list[ChangeEvent], scope: str) -> tuple[bool, bool]:
+    if scope == "all":
+        return True, True
+    if scope == "orders":
+        return True, False
+    if scope == "positions":
+        return False, True
+    if not events:
+        return True, True
+
+    # Direct event handling uses the GUI first; the destination observer can lag
+    # behind that action by a few seconds. Running authority sync in the same
+    # scan can misread the just-created/closed trade as still missing/extra.
+    return False, False
+
+
+def _sl_tp_reconcile_scope(events: list[ChangeEvent]) -> str | None:
+    has_order_update = any(
+        event.change_type == ChangeType.ORDER_UPDATED and _event_changes_sl_tp(event)
+        for event in events
+    )
+    has_position_update = any(
+        event.change_type == ChangeType.POSITION_UPDATED and _event_changes_sl_tp(event)
+        for event in events
+    )
+    if has_order_update and has_position_update:
+        return "all"
+    if has_order_update:
+        return "orders"
+    if has_position_update:
+        return "positions"
+    return None
+
+
+def _event_changes_sl_tp(event: ChangeEvent) -> bool:
+    return bool({"sl", "tp"} & set(event.changed_fields))
 
 
 def check_gui(

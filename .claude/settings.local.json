@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(Get-ChildItem -Path \"d:\\\\TRADING\\\\MT5_copy_manual\" -Recurse -Force)",
+      "Bash(Select-Object FullName)",
+      "Bash(ls \"d:\\\\TRADING\\\\MT5_copy_manual\\\\\" && ls \"d:\\\\TRADING\\\\MT5_copy_manual\\\\data\\\\images\")",
+      "Read(//d/TRADING/**)"
+    ]
+  }
+}

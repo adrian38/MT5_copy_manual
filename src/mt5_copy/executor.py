@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 from typing import Any
 
@@ -36,11 +37,13 @@ class PyAutoGuiExecutor:
         logger: logging.Logger,
         mapping_file: Path | None = None,
         destination_orders_file: Path | None = None,
+        destination_positions_file: Path | None = None,
     ) -> None:
         self.gui = gui
         self.logger = logger
         self.mapping_file = mapping_file
         self.destination_orders_file = destination_orders_file
+        self.destination_positions_file = destination_positions_file
 
     def handle(self, event: ChangeEvent) -> None:
         if event.change_type == ChangeType.ORDER_CREATED:
@@ -55,10 +58,13 @@ class PyAutoGuiExecutor:
             self._prepare_market_position(event)
             return
 
+        if event.change_type == ChangeType.POSITION_CLOSED:
+            self._close_position(event)
+            return
+
         if event.change_type in {
             ChangeType.ORDER_UPDATED,
             ChangeType.POSITION_UPDATED,
-            ChangeType.POSITION_CLOSED,
         }:
             self._log_unsupported_action(event)
             return
@@ -68,6 +74,13 @@ class PyAutoGuiExecutor:
     def _prepare_order_created(self, event: ChangeEvent) -> None:
         if not event.current:
             self.logger.warning("ORDER_CREATED event has no current row: %s", event.to_dict())
+            return
+        if _is_market_trade_type(event.trade_type):
+            self.logger.info(
+                "ORDER_CREATED ignored because it is a transient market row source_ticket=%s type=%s",
+                event.source_ticket,
+                event.trade_type,
+            )
             return
 
         prepared = self.gui.prepare_pending_order(event.current)
@@ -88,10 +101,34 @@ class PyAutoGuiExecutor:
             self.logger.warning("POSITION_OPENED event has no current row: %s", event.to_dict())
             return
 
-        prepared = self.gui.prepare_market_order(event.current)
+        before_tickets = self._destination_position_tickets()
+        prepared = self.gui.prepare_market_position(event.current)
+        time.sleep(self.gui.config.order_window_delay_seconds)
+        destination_ticket = self._find_new_destination_position_ticket(event.current, before_tickets)
+
+        if self.mapping_file is not None and destination_ticket is not None:
+            upsert_mapping(
+                self.mapping_file,
+                {
+                    "source_ticket": event.source_ticket,
+                    "destination_ticket": destination_ticket,
+                    "symbol": event.current.get("symbol", ""),
+                    "type": event.current.get("type", ""),
+                    "source_volume": event.current.get("volume", ""),
+                    "destination_volume": event.current.get("volume", ""),
+                    "status": "placed",
+                },
+            )
+        elif self.mapping_file is not None:
+            self.logger.error(
+                "POSITION_OPENED executed but destination ticket was not verified source_ticket=%s",
+                event.source_ticket,
+            )
+
         self.logger.info(
-            "POSITION_OPENED prepared source_ticket=%s symbol=%s type=%s volume=%s sl=%s tp=%s screenshot=%s",
+            "POSITION_OPENED executed source_ticket=%s destination_ticket=%s symbol=%s type=%s volume=%s sl=%s tp=%s screenshot=%s",
             prepared["source_ticket"],
+            destination_ticket or "",
             prepared["symbol"],
             prepared["type"],
             prepared["volume"],
@@ -100,7 +137,82 @@ class PyAutoGuiExecutor:
             prepared["screenshot_order_window"],
         )
 
+    def _close_position(self, event: ChangeEvent) -> None:
+        if self.mapping_file is None:
+            self.logger.warning(
+                "POSITION_CLOSED cannot execute because mapping_file is not configured source_ticket=%s",
+                event.source_ticket,
+            )
+            return
+
+        mapping = load_mapping(self.mapping_file)
+        map_row = mapping.get(str(event.source_ticket))
+        if not map_row:
+            self.logger.warning("POSITION_CLOSED has no destination mapping source_ticket=%s", event.source_ticket)
+            return
+        if map_row.get("status") != "placed":
+            self.logger.info(
+                "POSITION_CLOSED skipped because mapping status is not placed source_ticket=%s status=%s",
+                event.source_ticket,
+                map_row.get("status", ""),
+            )
+            return
+
+        destination_ticket = str(map_row.get("destination_ticket", ""))
+        if not destination_ticket:
+            self.logger.warning("POSITION_CLOSED mapping has no destination ticket source_ticket=%s", event.source_ticket)
+            return
+
+        current_tickets = self._destination_position_tickets()
+        if destination_ticket not in current_tickets:
+            updated = dict(map_row)
+            updated["status"] = "closed"
+            upsert_mapping(self.mapping_file, updated)
+            self.logger.info(
+                "POSITION_CLOSED mapping marked closed because destination ticket is already absent source_ticket=%s destination_ticket=%s",
+                event.source_ticket,
+                destination_ticket,
+            )
+            return
+
+        row_center = self._visible_position_row_center(destination_ticket)
+        if row_center is None:
+            self.logger.error(
+                "POSITION_CLOSED refused: exact destination position row is not visible/current source_ticket=%s destination_ticket=%s",
+                event.source_ticket,
+                destination_ticket,
+            )
+            return
+
+        screenshot = self.gui.close_position(destination_ticket, row_center=row_center)
+        time.sleep(self.gui.config.order_window_delay_seconds)
+        if destination_ticket in self._destination_position_tickets():
+            self.logger.error(
+                "POSITION_CLOSED did not remove destination_ticket=%s source_ticket=%s screenshot=%s",
+                destination_ticket,
+                event.source_ticket,
+                screenshot,
+            )
+            return
+
+        updated = dict(map_row)
+        updated["status"] = "closed"
+        upsert_mapping(self.mapping_file, updated)
+        self.logger.info(
+            "POSITION_CLOSED executed source_ticket=%s destination_ticket=%s screenshot=%s",
+            event.source_ticket,
+            destination_ticket,
+            screenshot,
+        )
+
     def _delete_order(self, event: ChangeEvent) -> None:
+        if _is_market_trade_type(event.trade_type):
+            self.logger.info(
+                "ORDER_DELETED ignored because it is a transient market row source_ticket=%s type=%s",
+                event.source_ticket,
+                event.trade_type,
+            )
+            return
         if self.mapping_file is None:
             self.logger.warning(
                 "ORDER_DELETED cannot execute because mapping_file is not configured source_ticket=%s",
@@ -207,6 +319,47 @@ class PyAutoGuiExecutor:
         y = top_y + (index * step_y)
         return anchor_x, y
 
+    def _destination_position_tickets(self) -> set[str]:
+        if self.destination_positions_file is None:
+            return set()
+        return {str(row.get("ticket", "")) for row in read_csv_rows(self.destination_positions_file)}
+
+    def _visible_position_row_center(self, destination_ticket: str) -> tuple[int, int] | None:
+        if self.destination_positions_file is None:
+            return None
+        rows = read_csv_rows(self.destination_positions_file)
+        tickets = [str(row.get("ticket", "")) for row in rows]
+        if destination_ticket not in tickets:
+            return None
+        index = tickets.index(destination_ticket)
+        coordinates = self.gui.config.order_form_coordinates
+        anchor_x, top_y = coordinates.get(
+            "position_row_anchor",
+            coordinates.get("position_row_fallback", (253, 721)),
+        )
+        _, step_y = coordinates.get("position_row_step_y", coordinates.get("order_row_step_y", (0, 20)))
+        y = top_y + (index * step_y)
+        max_y = coordinates.get("position_row_max_y", coordinates.get("order_row_max_y", (0, 941)))[1]
+        if y > max_y:
+            return None
+        return anchor_x, y
+
+    def _find_new_destination_position_ticket(
+        self,
+        source_position: dict[str, Any],
+        before_tickets: set[str],
+    ) -> str | None:
+        if self.destination_positions_file is None:
+            return None
+
+        for row in read_csv_rows(self.destination_positions_file):
+            ticket = str(row.get("ticket", ""))
+            if ticket in before_tickets:
+                continue
+            if _position_matches_market_source(source_position, row):
+                return ticket
+        return None
+
 
 def _order_field_mismatches(
     source_row: dict[str, Any],
@@ -248,6 +401,24 @@ def _normalize_compare_value(value: Any) -> str:
         return str(value).strip().upper()
 
 
+def _position_matches_market_source(
+    source_position: dict[str, Any],
+    destination_position: dict[str, Any],
+) -> bool:
+    return (
+        _normalize_compare_value(source_position.get("symbol"))
+        == _normalize_compare_value(destination_position.get("symbol"))
+        and _normalize_compare_value(source_position.get("type"))
+        == _normalize_compare_value(destination_position.get("type"))
+        and _normalize_compare_value(source_position.get("volume"))
+        == _normalize_compare_value(destination_position.get("volume"))
+    )
+
+
+def _is_market_trade_type(trade_type: Any) -> bool:
+    return str(trade_type).strip().upper() in {"BUY", "SELL"}
+
+
 def gui_config_from_executor_settings(settings: dict[str, Any], project_root: Path) -> GuiConfig:
     def project_path(value: str) -> Path:
         path = Path(value)
@@ -278,6 +449,9 @@ def gui_config_from_executor_settings(settings: dict[str, Any], project_root: Pa
             key: (int(value[0]), int(value[1]))
             for key, value in dict(settings.get("order_form_coordinates", {})).items()
         },
+        order_search_scroll_pages=int(settings.get("order_search_scroll_pages", 4)),
+        order_search_scroll_clicks=int(settings.get("order_search_scroll_clicks", 8)),
+        order_search_arrow_down_presses=int(settings.get("order_search_arrow_down_presses", 8)),
     )
 
 
@@ -300,6 +474,7 @@ def build_executor(
     project_root: Path | None = None,
     mapping_file: Path | None = None,
     destination_orders_file: Path | None = None,
+    destination_positions_file: Path | None = None,
 ):
     if mode == "pyautogui" and pyautogui_enabled:
         if executor_settings is None or project_root is None:
@@ -310,5 +485,6 @@ def build_executor(
             logger,
             mapping_file=mapping_file,
             destination_orders_file=destination_orders_file,
+            destination_positions_file=destination_positions_file,
         )
     return DryRunExecutor(logger)

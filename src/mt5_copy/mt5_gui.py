@@ -33,6 +33,9 @@ class GuiConfig:
     field_delay_seconds: float
     comment_prefix: str
     order_form_coordinates: dict[str, tuple[int, int]]
+    order_search_scroll_pages: int = 4
+    order_search_scroll_clicks: int = 8
+    order_search_arrow_down_presses: int = 8
 
 
 class Mt5GuiController:
@@ -313,6 +316,39 @@ class Mt5GuiController:
         prepared["screenshot_submitted"] = str(submit_screenshot)
         return prepared
 
+    def prepare_market_position(self, position: dict[str, Any]) -> dict[str, Any]:
+        self.close_active_dialog()
+        screenshot_before = self.screenshot("before_position_opened")
+        order_window = self.open_new_order_window()
+        symbol_screenshot = self.select_symbol(str(position.get("symbol", "")))
+        market_mode_screenshot = self.switch_to_market_order_mode()
+        fields_screenshot = self.fill_market_position_fields(position)
+        prepared = {
+            "source_ticket": position.get("ticket", ""),
+            "symbol": position.get("symbol", ""),
+            "type": position.get("type", ""),
+            "volume": position.get("volume", ""),
+            "sl": position.get("sl", ""),
+            "tp": position.get("tp", ""),
+            "screenshot_before": str(screenshot_before),
+            "screenshot_order_window": str(order_window),
+            "screenshot_symbol_selected": str(symbol_screenshot),
+            "screenshot_market_mode": str(market_mode_screenshot),
+            "screenshot_fields_filled": str(fields_screenshot),
+            "submit_orders": self.config.submit_orders,
+        }
+
+        if not self.config.submit_orders:
+            self.logger.warning(
+                "Market submit is disabled. Prepared market position only: %s",
+                prepared,
+            )
+            return prepared
+
+        submit_screenshot = self.submit_market_position(str(position.get("type", "")))
+        prepared["screenshot_submitted"] = str(submit_screenshot)
+        return prepared
+
     def submit_pending_order(self) -> Path:
         self._require_armed("submit pending order")
         coordinates = self.config.order_form_coordinates
@@ -324,6 +360,21 @@ class Mt5GuiController:
         time.sleep(self.config.order_window_delay_seconds)
         screenshot_path = self.screenshot("after_place_clicked")
         self.logger.info("Clicked pending order Place button: %s", screenshot_path)
+        return screenshot_path
+
+    def submit_market_position(self, trade_type: str) -> Path:
+        self._require_armed("submit market position")
+        coordinates = self.config.order_form_coordinates
+        button_name = "market_buy" if trade_type == "BUY" else "market_sell"
+        if button_name not in coordinates:
+            raise GuiSafetyError(f"Missing coordinates for order field: {button_name}")
+
+        x, y = coordinates[button_name]
+        self.pyautogui.click(x, y)
+        time.sleep(self.config.order_window_delay_seconds)
+        screenshot_path = self.screenshot("after_market_clicked")
+        self.logger.info("Clicked market %s button: %s", trade_type, screenshot_path)
+        self.accept_active_dialog()
         return screenshot_path
 
     def modify_pending_order_sl_tp(self, destination_ticket: str, sl: Any, tp: Any) -> Path:
@@ -374,9 +425,15 @@ class Mt5GuiController:
         self.accept_active_dialog()
         return screenshot_path
 
-    def modify_position_sl_tp(self, destination_ticket: str, sl: Any, tp: Any) -> Path:
+    def modify_position_sl_tp(
+        self,
+        destination_ticket: str,
+        sl: Any,
+        tp: Any,
+        row_center: tuple[int, int] | None = None,
+    ) -> Path:
         self._require_armed("modify position sl/tp")
-        self.open_existing_position_modify_dialog(destination_ticket)
+        self.open_existing_position_modify_dialog(destination_ticket, row_center=row_center)
         coordinates = self.config.order_form_coordinates
         self._replace_field_text("position_modify_sl", _format_number(sl), coordinates)
         self._replace_field_text("position_modify_tp", _format_number(tp), coordinates)
@@ -388,6 +445,12 @@ class Mt5GuiController:
         self.pyautogui.click(x, y)
         time.sleep(self.config.order_window_delay_seconds)
         screenshot_path = self.screenshot("after_position_modify_sl_tp_clicked")
+        if self._trade_dialog_is_open():
+            self.logger.warning(
+                "Position modify dialog remained open after click destination_ticket=%s; dismissing dialog.",
+                destination_ticket,
+            )
+            self._dismiss_active_dialog()
         self.logger.info(
             "Modified position destination_ticket=%s sl=%s tp=%s screenshot=%s",
             destination_ticket,
@@ -397,6 +460,51 @@ class Mt5GuiController:
         )
         self.accept_active_dialog()
         return screenshot_path
+
+    def close_position(self, destination_ticket: str, row_center: tuple[int, int] | None = None) -> Path:
+        self._require_armed("close position")
+        self.close_active_dialog()
+        self.focus_mt5()
+
+        if row_center is None:
+            screenshot_path = self.screenshot("position_close_ticket_not_found")
+            raise GuiSafetyError(
+                f"Destination position ticket {destination_ticket} has no verified row center. Screenshot: {screenshot_path}"
+            )
+
+        coordinates = self.config.order_form_coordinates
+        close_x = coordinates.get("position_close_x", (1892, row_center[1]))[0]
+        close_point = self._clamp_point_to_screen((close_x, row_center[1]))
+        self.pyautogui.click(*close_point)
+        time.sleep(self.config.order_window_delay_seconds)
+        screenshot_path = self.screenshot("after_position_close_clicked")
+        if self._accept_one_click_terms_if_open():
+            self.focus_mt5()
+            self.pyautogui.click(*close_point)
+            time.sleep(self.config.order_window_delay_seconds)
+            screenshot_path = self.screenshot("after_position_close_clicked")
+        self.logger.info(
+            "Closed position click destination_ticket=%s point=%s screenshot=%s",
+            destination_ticket,
+            close_point,
+            screenshot_path,
+        )
+        self.accept_active_dialog()
+        return screenshot_path
+
+    def _accept_one_click_terms_if_open(self) -> bool:
+        if not self._dialog_title_is_open("Trading con un clic"):
+            return False
+
+        coordinates = self.config.order_form_coordinates
+        checkbox = coordinates.get("one_click_terms_checkbox", (738, 654))
+        accept = coordinates.get("one_click_accept", (1068, 654))
+        self.pyautogui.click(*self._clamp_point_to_screen(checkbox))
+        time.sleep(self.config.field_delay_seconds)
+        self.pyautogui.click(*self._clamp_point_to_screen(accept))
+        time.sleep(self.config.order_window_delay_seconds)
+        self.logger.info("Accepted MT5 one-click trading terms for position close.")
+        return True
 
     def open_existing_order_dialog(
         self,
@@ -408,38 +516,51 @@ class Mt5GuiController:
         if not candidates:
             candidates = [None]
 
-        for candidate in candidates:
-            self._dismiss_active_dialog()
-            self.focus_mt5()
-            if not self._click_order_row_by_ticket(destination_ticket, row_center=candidate):
-                continue
+        for page in range(self.config.order_search_scroll_pages + 1):
+            for candidate in candidates:
+                self._dismiss_active_dialog()
+                self.focus_mt5()
+                if not self._click_order_row_by_ticket(destination_ticket, row_center=candidate):
+                    continue
 
-            time.sleep(self.config.order_window_delay_seconds)
-            if not self._order_dialog_is_open():
-                continue
+                time.sleep(self.config.order_window_delay_seconds)
+                if not self._order_dialog_is_open():
+                    continue
 
-            if self._trade_dialog_title_contains(str(destination_ticket)):
-                screenshot_path = self.screenshot("modify_order_opened")
-                self.logger.info("Opened modify dialog for ticket=%s: %s", destination_ticket, screenshot_path)
-                return screenshot_path
+                if self._trade_dialog_title_contains(str(destination_ticket)):
+                    screenshot_path = self.screenshot("modify_order_opened")
+                    self.logger.info("Opened modify dialog for ticket=%s: %s", destination_ticket, screenshot_path)
+                    return screenshot_path
 
-            self.logger.warning(
-                "Opened a different order dialog while searching for ticket=%s candidate=%s",
-                destination_ticket,
-                candidate,
-            )
+                self.logger.warning(
+                    "Opened a different order dialog while searching for ticket=%s page=%s candidate=%s",
+                    destination_ticket,
+                    page,
+                    candidate,
+                )
+
+            if page < self.config.order_search_scroll_pages:
+                self._dismiss_active_dialog()
+                self._scroll_order_list_down(page + 1)
 
         screenshot_path = self.screenshot("modify_order_ticket_not_found")
+        self._dismiss_active_dialog()
         raise GuiSafetyError(
             f"Could not open modify dialog for expected ticket {destination_ticket}. "
             f"Screenshot: {screenshot_path}"
         )
 
-    def open_existing_position_modify_dialog(self, destination_ticket: str) -> Path:
+    def open_existing_position_modify_dialog(
+        self,
+        destination_ticket: str,
+        row_center: tuple[int, int] | None = None,
+    ) -> Path:
         self._require_armed("open existing position modify dialog")
         self.close_active_dialog()
         self.focus_mt5()
-        if not self._right_click_ticket_row(destination_ticket):
+        if row_center is not None:
+            self.pyautogui.rightClick(*self._clamp_point_to_screen(row_center))
+        elif not self._right_click_ticket_row(destination_ticket):
             screenshot_path = self.screenshot("position_ticket_not_visible")
             raise GuiSafetyError(
                 f"Destination position ticket {destination_ticket} was not visible in toolbox. "
@@ -507,14 +628,58 @@ class Mt5GuiController:
         if anchor is not None:
             anchor_x, anchor_y = anchor
             _, step_y = step
+            max_y = coordinates.get("order_row_max_y", (0, 941))[1]
             for index in range(scan_rows):
                 candidate = (anchor_x, anchor_y + (index * step_y))
+                if candidate[1] > max_y:
+                    continue
+                if not self._point_inside_screen(candidate):
+                    continue
                 if candidate not in candidates:
                     candidates.append(candidate)
 
         if preferred is None:
             candidates.append(None)
         return candidates
+
+    def _scroll_order_list_down(self, page: int) -> None:
+        self.focus_mt5()
+        coordinates = self.config.order_form_coordinates
+        point = coordinates.get("order_list_scroll_point")
+        if point is None:
+            anchor = coordinates.get("order_row_anchor", (253, 741))
+            scan_rows = int(coordinates.get("order_scan_rows", (0, 12))[1])
+            _, step_y = coordinates.get("order_row_step_y", (0, 20))
+            point = (anchor[0], anchor[1] + max(0, scan_rows - 1) * step_y)
+
+        focus_point = self._last_visible_order_row_point()
+        point = self._clamp_point_to_screen(focus_point or point)
+        self.pyautogui.click(*point)
+        time.sleep(self.config.field_delay_seconds)
+        self.pyautogui.press("down", presses=max(1, self.config.order_search_arrow_down_presses))
+        time.sleep(self.config.order_window_delay_seconds)
+        self.logger.info(
+            "Advanced destination order list while searching page=%s focus_point=%s arrow_down_presses=%s",
+            page,
+            point,
+            self.config.order_search_arrow_down_presses,
+        )
+
+    def _last_visible_order_row_point(self) -> tuple[int, int] | None:
+        candidates = [candidate for candidate in self._order_row_candidates(None) if candidate is not None]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda point: point[1])
+
+    def _point_inside_screen(self, point: tuple[int, int]) -> bool:
+        width, height = self.pyautogui.size()
+        x, y = point
+        return 0 <= x < width and 0 <= y < height
+
+    def _clamp_point_to_screen(self, point: tuple[int, int]) -> tuple[int, int]:
+        width, height = self.pyautogui.size()
+        x, y = point
+        return max(0, min(x, width - 1)), max(0, min(y, height - 1))
 
     def _right_click_ticket_row(self, destination_ticket: str) -> bool:
         center = self._locate_ticket_center(destination_ticket)
@@ -600,6 +765,37 @@ class Mt5GuiController:
         time.sleep(self.config.order_window_delay_seconds)
         screenshot_path = self.screenshot("pending_order_mode")
         self.logger.info("Switched order window to pending mode: %s", screenshot_path)
+        return screenshot_path
+
+    def switch_to_market_order_mode(self) -> Path:
+        self._require_armed("switch to market order mode")
+        if not self._order_dialog_is_open():
+            screenshot_path = self.screenshot("market_order_not_open")
+            raise GuiSafetyError(f"Market order dialog is not open. Screenshot: {screenshot_path}")
+
+        time.sleep(self.config.order_window_delay_seconds)
+        screenshot_path = self.screenshot("market_order_mode")
+        self.logger.info("Using current order window market mode: %s", screenshot_path)
+        return screenshot_path
+
+    def fill_market_position_fields(self, position: dict[str, Any]) -> Path:
+        self._require_armed("fill market position fields")
+        coordinates = self.config.order_form_coordinates
+        values = {
+            "market_volume": _format_number(position.get("volume", "")),
+            "market_sl": _format_number(position.get("sl", "")),
+            "market_tp": _format_number(position.get("tp", "")),
+        }
+
+        for field_name, value in values.items():
+            self._replace_field_text(field_name, value, coordinates)
+
+        screenshot_path = self.screenshot("market_position_fields_filled")
+        self.logger.info(
+            "Filled market position fields: type=%s values=%s",
+            position.get("type", ""),
+            values,
+        )
         return screenshot_path
 
     def fill_basic_order_fields(self, order: dict[str, Any]) -> Path:
