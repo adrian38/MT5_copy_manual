@@ -203,6 +203,135 @@ class ExecutorTest(unittest.TestCase):
             self.assertEqual(rows[0]["type"], "BUY_STOP")
             self.assertEqual(rows[0]["status"], "placed")
 
+    def test_order_created_adopts_existing_destination_instead_of_duplicate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mapping_file = Path(tmp) / "mapping.csv"
+            source_orders_file = Path(tmp) / "source_orders.csv"
+            destination_orders_file = Path(tmp) / "destination_orders.csv"
+
+            fieldnames = ["ticket", "symbol", "type", "volume_current", "price_open", "sl", "tp"]
+            source = {
+                "ticket": "1",
+                "symbol": "XAUUSD",
+                "type": "BUY_STOP",
+                "volume_current": "0.01",
+                "price_open": "100.0",
+                "sl": "90.0",
+                "tp": "120.0",
+            }
+            with source_orders_file.open("w", encoding="utf-8", newline="") as fh:
+                writer = csv.DictWriter(fh, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerow(source)
+            with destination_orders_file.open("w", encoding="utf-8", newline="") as fh:
+                writer = csv.DictWriter(fh, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerow({**source, "ticket": "77"})
+
+            gui = FakeGui()
+            executor = PyAutoGuiExecutor(
+                gui,
+                FakeLogger(),
+                mapping_file=mapping_file,
+                source_orders_file=source_orders_file,
+                destination_orders_file=destination_orders_file,
+            )
+            executor.handle(
+                ChangeEvent(
+                    change_type=ChangeType.ORDER_CREATED,
+                    source_ticket="1",
+                    symbol="XAUUSD",
+                    trade_type="BUY_STOP",
+                    previous=None,
+                    current=source,
+                    changed_fields={},
+                )
+            )
+
+            self.assertEqual(gui.prepared_pending_orders, [])
+            with mapping_file.open("r", encoding="utf-8", newline="") as fh:
+                rows = list(csv.DictReader(fh))
+            self.assertEqual(rows[0]["source_ticket"], "1")
+            self.assertEqual(rows[0]["destination_ticket"], "77")
+            self.assertEqual(rows[0]["status"], "placed")
+
+    def test_order_created_can_reuse_destination_from_stale_mapping(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mapping_file = Path(tmp) / "mapping.csv"
+            source_orders_file = Path(tmp) / "source_orders.csv"
+            destination_orders_file = Path(tmp) / "destination_orders.csv"
+
+            with mapping_file.open("w", encoding="utf-8", newline="") as fh:
+                writer = csv.DictWriter(
+                    fh,
+                    fieldnames=[
+                        "source_ticket",
+                        "destination_ticket",
+                        "symbol",
+                        "type",
+                        "source_volume",
+                        "destination_volume",
+                        "status",
+                    ],
+                )
+                writer.writeheader()
+                writer.writerow(
+                    {
+                        "source_ticket": "old-source",
+                        "destination_ticket": "77",
+                        "symbol": "XAUUSD",
+                        "type": "BUY_STOP",
+                        "source_volume": "0.01",
+                        "destination_volume": "0.01",
+                        "status": "placed",
+                    }
+                )
+
+            fieldnames = ["ticket", "symbol", "type", "volume_current", "price_open", "sl", "tp"]
+            source = {
+                "ticket": "1",
+                "symbol": "XAUUSD",
+                "type": "BUY_STOP",
+                "volume_current": "0.01",
+                "price_open": "100.0",
+                "sl": "90.0",
+                "tp": "120.0",
+            }
+            with source_orders_file.open("w", encoding="utf-8", newline="") as fh:
+                writer = csv.DictWriter(fh, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerow(source)
+            with destination_orders_file.open("w", encoding="utf-8", newline="") as fh:
+                writer = csv.DictWriter(fh, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerow({**source, "ticket": "77"})
+
+            gui = FakeGui()
+            executor = PyAutoGuiExecutor(
+                gui,
+                FakeLogger(),
+                mapping_file=mapping_file,
+                source_orders_file=source_orders_file,
+                destination_orders_file=destination_orders_file,
+            )
+            executor.handle(
+                ChangeEvent(
+                    change_type=ChangeType.ORDER_CREATED,
+                    source_ticket="1",
+                    symbol="XAUUSD",
+                    trade_type="BUY_STOP",
+                    previous=None,
+                    current=source,
+                    changed_fields={},
+                )
+            )
+
+            self.assertEqual(gui.prepared_pending_orders, [])
+            with mapping_file.open("r", encoding="utf-8", newline="") as fh:
+                rows = {row["source_ticket"]: row for row in csv.DictReader(fh)}
+            self.assertEqual(rows["1"]["destination_ticket"], "77")
+            self.assertEqual(rows["1"]["status"], "placed")
+
     def test_order_deleted_skips_when_destination_does_not_match_source(self):
         with tempfile.TemporaryDirectory() as tmp:
             mapping_file = Path(tmp) / "mapping.csv"
@@ -278,6 +407,83 @@ class ExecutorTest(unittest.TestCase):
             )
 
             self.assertEqual(gui.deleted_tickets, [])
+
+    def test_order_deleted_skips_when_destination_matches_active_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mapping_file = Path(tmp) / "mapping.csv"
+            with mapping_file.open("w", encoding="utf-8", newline="") as fh:
+                writer = csv.DictWriter(
+                    fh,
+                    fieldnames=[
+                        "source_ticket",
+                        "destination_ticket",
+                        "symbol",
+                        "type",
+                        "source_volume",
+                        "destination_volume",
+                        "status",
+                    ],
+                )
+                writer.writeheader()
+                writer.writerow(
+                    {
+                        "source_ticket": "old-source",
+                        "destination_ticket": "2",
+                        "symbol": "XAUUSD",
+                        "type": "BUY_STOP",
+                        "source_volume": "0.01",
+                        "destination_volume": "0.01",
+                        "status": "placed",
+                    }
+                )
+
+            fieldnames = ["ticket", "symbol", "type", "volume_current", "price_open", "sl", "tp"]
+            active_source = {
+                "ticket": "new-source",
+                "symbol": "XAUUSD",
+                "type": "BUY_STOP",
+                "volume_current": "0.01",
+                "price_open": "100.0",
+                "sl": "90.0",
+                "tp": "120.0",
+            }
+            source_orders_file = Path(tmp) / "source_orders.csv"
+            with source_orders_file.open("w", encoding="utf-8", newline="") as fh:
+                writer = csv.DictWriter(fh, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerow(active_source)
+
+            destination_orders_file = Path(tmp) / "destination_orders.csv"
+            with destination_orders_file.open("w", encoding="utf-8", newline="") as fh:
+                writer = csv.DictWriter(fh, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerow({**active_source, "ticket": "2"})
+
+            gui = FakeGui()
+            executor = PyAutoGuiExecutor(
+                gui,
+                FakeLogger(),
+                mapping_file=mapping_file,
+                source_orders_file=source_orders_file,
+                destination_orders_file=destination_orders_file,
+            )
+            executor.handle(
+                ChangeEvent(
+                    change_type=ChangeType.ORDER_DELETED,
+                    source_ticket="old-source",
+                    symbol="XAUUSD",
+                    trade_type="BUY_STOP",
+                    previous=active_source,
+                    current=None,
+                    changed_fields={},
+                )
+            )
+
+            self.assertEqual(gui.deleted_tickets, [])
+            with mapping_file.open("r", encoding="utf-8", newline="") as fh:
+                rows = {row["source_ticket"]: row for row in csv.DictReader(fh)}
+            self.assertEqual(rows["new-source"]["destination_ticket"], "2")
+            self.assertEqual(rows["new-source"]["status"], "placed")
 
     def test_order_deleted_uses_csv_order_top_to_bottom_for_row_center(self):
         with tempfile.TemporaryDirectory() as tmp:

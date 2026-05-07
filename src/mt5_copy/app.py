@@ -91,6 +91,7 @@ def run_once(
         executor_settings=config.executor,
         project_root=PROJECT_ROOT,
         mapping_file=config.mapping_file,
+        source_orders_file=config.orders_file,
         destination_orders_file=config.destination_orders_file,
         destination_positions_file=config.destination_positions_file,
     )

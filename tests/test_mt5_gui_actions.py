@@ -149,8 +149,7 @@ class Mt5GuiActionsTest(unittest.TestCase):
 
         self.assertEqual(screenshot, Path("after_position_context_close_clicked.png"))
         self.assertIn(("rightClick", (180, 513)), gui.pyautogui.calls)
-        self.assertIn(("press", ("down", 2)), gui.pyautogui.calls)
-        self.assertIn(("press", ("enter", 1)), gui.pyautogui.calls)
+        self.assertIn(("click", _coords()["position_context_close"]), gui.pyautogui.calls)
         self.assertNotIn(("click", (1358, 513)), gui.pyautogui.calls)
 
     def test_close_position_context_menu_selects_close_command(self):
@@ -160,8 +159,7 @@ class Mt5GuiActionsTest(unittest.TestCase):
 
         self.assertEqual(screenshot, Path("after_position_context_close_clicked.png"))
         self.assertIn(("rightClick", (180, 513)), gui.pyautogui.calls)
-        self.assertIn(("press", ("down", 2)), gui.pyautogui.calls)
-        self.assertIn(("press", ("enter", 1)), gui.pyautogui.calls)
+        self.assertIn(("click", _coords()["position_context_close"]), gui.pyautogui.calls)
 
 
 def _config():
@@ -201,6 +199,8 @@ def _coords():
         "position_modify_sl": (746, 316),
         "position_modify_tp": (746, 336),
         "position_modify": (794, 409),
+        "position_context_modify": (270, 353),
+        "position_context_close": (270, 329),
         "position_close_x": (1358, 513),
         "market_volume": (746, 316),
         "market_sl": (746, 336),

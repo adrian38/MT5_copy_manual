@@ -36,12 +36,14 @@ class PyAutoGuiExecutor:
         gui: Mt5GuiController,
         logger: logging.Logger,
         mapping_file: Path | None = None,
+        source_orders_file: Path | None = None,
         destination_orders_file: Path | None = None,
         destination_positions_file: Path | None = None,
     ) -> None:
         self.gui = gui
         self.logger = logger
         self.mapping_file = mapping_file
+        self.source_orders_file = source_orders_file
         self.destination_orders_file = destination_orders_file
         self.destination_positions_file = destination_positions_file
 
@@ -82,6 +84,8 @@ class PyAutoGuiExecutor:
                 event.trade_type,
             )
             return
+        if self._order_created_is_already_handled(event):
+            return
 
         before_tickets = self._destination_order_tickets()
         prepared = self.gui.prepare_pending_order(event.current)
@@ -119,6 +123,65 @@ class PyAutoGuiExecutor:
             prepared["tp"],
             prepared["screenshot_order_window"],
         )
+
+    def _order_created_is_already_handled(self, event: ChangeEvent) -> bool:
+        if self.mapping_file is None or self.destination_orders_file is None or not event.current:
+            return False
+
+        mapping = load_mapping(self.mapping_file)
+        source_ticket = str(event.source_ticket)
+        existing = mapping.get(source_ticket)
+        if existing and existing.get("status") == "placed":
+            destination_ticket = str(existing.get("destination_ticket", ""))
+            destination = self._destination_order_row(destination_ticket)
+            if destination is None:
+                self.logger.error(
+                    "ORDER_CREATED skipped because mapped destination is missing. Manual review required source_ticket=%s destination_ticket=%s",
+                    source_ticket,
+                    destination_ticket,
+                )
+                return True
+
+            mismatches = _order_field_mismatches(event.current, destination)
+            if mismatches:
+                self.logger.error(
+                    "ORDER_CREATED skipped because mapped destination does not match source. Manual review required source_ticket=%s destination_ticket=%s mismatches=%s",
+                    source_ticket,
+                    destination_ticket,
+                    mismatches,
+                )
+                return True
+
+            self.logger.info(
+                "ORDER_CREATED skipped because source is already mapped source_ticket=%s destination_ticket=%s",
+                source_ticket,
+                destination_ticket,
+            )
+            return True
+
+        destination = self._find_existing_equivalent_destination_order(event.current, mapping, source_ticket)
+        if destination is None:
+            return False
+
+        destination_ticket = str(destination.get("ticket", ""))
+        upsert_mapping(
+            self.mapping_file,
+            {
+                "source_ticket": source_ticket,
+                "destination_ticket": destination_ticket,
+                "symbol": event.current.get("symbol", ""),
+                "type": event.current.get("type", ""),
+                "source_volume": event.current.get("volume_current", event.current.get("volume_initial", "")),
+                "destination_volume": destination.get("volume_current", destination.get("volume_initial", "")),
+                "status": "placed",
+            },
+        )
+        self.logger.info(
+            "ORDER_CREATED adopted existing destination order instead of opening duplicate source_ticket=%s destination_ticket=%s",
+            source_ticket,
+            destination_ticket,
+        )
+        return True
 
     def _prepare_market_position(self, event: ChangeEvent) -> None:
         if not event.current:
@@ -308,6 +371,35 @@ class PyAutoGuiExecutor:
             )
             return
 
+        active_source = self._find_active_source_order_matching_destination(
+            destination_row,
+            exclude_source_ticket=str(event.source_ticket),
+        )
+        if active_source is not None:
+            active_source_ticket = str(active_source.get("ticket", ""))
+            upsert_mapping(
+                self.mapping_file,
+                {
+                    "source_ticket": active_source_ticket,
+                    "destination_ticket": destination_ticket,
+                    "symbol": active_source.get("symbol", ""),
+                    "type": active_source.get("type", ""),
+                    "source_volume": active_source.get("volume_current", active_source.get("volume_initial", "")),
+                    "destination_volume": destination_row.get(
+                        "volume_current",
+                        destination_row.get("volume_initial", ""),
+                    ),
+                    "status": "placed",
+                },
+            )
+            self.logger.warning(
+                "ORDER_DELETED skipped because destination still matches active source source_ticket=%s active_source_ticket=%s destination_ticket=%s",
+                event.source_ticket,
+                active_source_ticket,
+                destination_ticket,
+            )
+            return
+
         source_row = event.previous or {}
         mismatches = _order_field_mismatches(source_row, destination_row)
         if mismatches:
@@ -338,10 +430,64 @@ class PyAutoGuiExecutor:
                 return row
         return None
 
+    def _destination_order_rows(self) -> list[dict[str, Any]]:
+        if self.destination_orders_file is None:
+            return []
+        return read_csv_rows(self.destination_orders_file)
+
     def _destination_order_tickets(self) -> set[str]:
         if self.destination_orders_file is None:
             return set()
         return {str(row.get("ticket", "")) for row in read_csv_rows(self.destination_orders_file)}
+
+    def _find_existing_equivalent_destination_order(
+        self,
+        source_order: dict[str, Any],
+        mapping: dict[str, dict[str, Any]],
+        source_ticket: str,
+    ) -> dict[str, Any] | None:
+        active_source_tickets = self._active_source_order_tickets()
+        mapped_destinations = {
+            str(row.get("destination_ticket", ""))
+            for mapped_source, row in mapping.items()
+            if row.get("status") == "placed"
+            and str(mapped_source) != source_ticket
+            and (active_source_tickets is None or str(mapped_source) in active_source_tickets)
+        }
+
+        for destination in self._destination_order_rows():
+            destination_ticket = str(destination.get("ticket", ""))
+            if destination_ticket in mapped_destinations:
+                continue
+            if not _order_field_mismatches(source_order, destination):
+                return destination
+        return None
+
+    def _find_active_source_order_matching_destination(
+        self,
+        destination_order: dict[str, Any],
+        exclude_source_ticket: str,
+    ) -> dict[str, Any] | None:
+        if self.source_orders_file is None:
+            return None
+        for source in read_csv_rows(self.source_orders_file):
+            source_ticket = str(source.get("ticket", ""))
+            if source_ticket == exclude_source_ticket:
+                continue
+            if _is_market_trade_type(source.get("type")):
+                continue
+            if not _order_field_mismatches(source, destination_order):
+                return source
+        return None
+
+    def _active_source_order_tickets(self) -> set[str] | None:
+        if self.source_orders_file is None:
+            return None
+        return {
+            str(row.get("ticket", ""))
+            for row in read_csv_rows(self.source_orders_file)
+            if not _is_market_trade_type(row.get("type"))
+        }
 
     def _log_unsupported_action(self, event: ChangeEvent) -> None:
         try:
@@ -639,6 +785,7 @@ def build_executor(
     mapping_file: Path | None = None,
     destination_orders_file: Path | None = None,
     destination_positions_file: Path | None = None,
+    source_orders_file: Path | None = None,
 ):
     if mode == "pyautogui" and pyautogui_enabled:
         if executor_settings is None or project_root is None:
@@ -648,6 +795,7 @@ def build_executor(
             gui,
             logger,
             mapping_file=mapping_file,
+            source_orders_file=source_orders_file,
             destination_orders_file=destination_orders_file,
             destination_positions_file=destination_positions_file,
         )

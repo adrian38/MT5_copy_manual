@@ -499,8 +499,12 @@ class Mt5GuiController:
             )
 
         time.sleep(self.config.field_delay_seconds)
-        self.pyautogui.press("down", presses=2)
-        self.pyautogui.press("enter")
+        coordinates = self.config.order_form_coordinates
+        if "position_context_close" in coordinates:
+            self.pyautogui.click(*coordinates["position_context_close"])
+        else:
+            self.pyautogui.press("down", presses=1)
+            self.pyautogui.press("enter")
         time.sleep(self.config.order_window_delay_seconds)
         if self._trade_dialog_is_open():
             self._submit_position_close_dialog(trade_type)
@@ -610,8 +614,10 @@ class Mt5GuiController:
         )
 
         time.sleep(self.config.field_delay_seconds)
-        self.pyautogui.press("down", presses=2)
-        self.pyautogui.press("enter")
+        coordinates = self.config.order_form_coordinates
+        if "position_context_modify" not in coordinates:
+            raise GuiSafetyError("Missing coordinates for position field: position_context_modify")
+        self.pyautogui.click(*coordinates["position_context_modify"])
         time.sleep(self.config.order_window_delay_seconds)
         if not self._trade_dialog_is_open():
             screenshot_path = self.screenshot("modify_position_not_open")

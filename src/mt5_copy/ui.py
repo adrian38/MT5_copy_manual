@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import logging
 import json
@@ -8,7 +8,7 @@ import time
 import tkinter as tk
 from dataclasses import dataclass
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import ttk
 from typing import Any
 
 from .app import run_once
@@ -70,51 +70,6 @@ class QueueLogHandler(logging.Handler):
 
     def _is_event_message(self, message: str) -> bool:
         return any(pattern in message for pattern in self.EVENT_PATTERNS)
-
-
-def apply_automatic_coordinate_calibration(
-    raw: dict[str, Any],
-    current_w: int,
-    current_h: int,
-) -> tuple[int, int, float, float]:
-    origin_w, origin_h = 1920, 1080
-    executor = raw.setdefault("executor", {})
-
-    if "coordinate_baseline" not in raw:
-        raw["coordinate_baseline"] = {
-            "resolution": [origin_w, origin_h],
-            "order_form_coordinates": executor.get("order_form_coordinates", {}),
-            "new_order_button": executor.get("new_order_button"),
-        }
-
-    baseline = raw["coordinate_baseline"]
-    base_w, base_h = (int(part) for part in baseline.get("resolution", [origin_w, origin_h]))
-    if base_w <= 0 or base_h <= 0:
-        base_w, base_h = origin_w, origin_h
-        baseline["resolution"] = [base_w, base_h]
-
-    scale_x = current_w / base_w
-    scale_y = current_h / base_h
-
-    non_coord = {"order_scan_rows"}
-    new_coords: dict[str, Any] = {}
-    for key, val in dict(baseline.get("order_form_coordinates", {})).items():
-        if key in non_coord or not isinstance(val, list) or len(val) != 2:
-            new_coords[key] = val
-        else:
-            new_coords[key] = [round(float(val[0]) * scale_x), round(float(val[1]) * scale_y)]
-
-    executor["order_form_coordinates"] = new_coords
-
-    base_btn = baseline.get("new_order_button")
-    if isinstance(base_btn, list) and len(base_btn) == 2:
-        executor["new_order_button"] = [
-            round(float(base_btn[0]) * scale_x),
-            round(float(base_btn[1]) * scale_y),
-        ]
-
-    executor["calibrated_resolution"] = [current_w, current_h]
-    return base_w, base_h, scale_x, scale_y
 
 
 class CopyMonitorApp:
@@ -232,14 +187,11 @@ class CopyMonitorApp:
         ttk.Button(controls, text="Guardar terminales", command=lambda: self._safe_ui_call(self._save_terminal_settings)).grid(
             row=0, column=4, padx=(8, 0)
         )
-        ttk.Button(controls, text="Calibrar pantalla", command=lambda: self._safe_ui_call(self._calibrate_coordinates)).grid(
-            row=0, column=5, padx=(8, 0)
-        )
         self.telegram_btn = ttk.Button(
             controls, text=self._telegram_btn_text(),
             command=lambda: self._safe_ui_call(self._toggle_telegram),
         )
-        self.telegram_btn.grid(row=0, column=6, padx=(8, 0))
+        self.telegram_btn.grid(row=0, column=5, padx=(8, 0))
 
         routing = ttk.LabelFrame(self.root, text="Ruta de copia", padding=10)
         routing.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 10))
@@ -500,75 +452,6 @@ class CopyMonitorApp:
         estado = "activadas" if new_state else "desactivadas"
         self.logger.info("Notificaciones Telegram %s", estado)
 
-    def _calibrate_coordinates(self) -> None:
-        try:
-            import pyautogui as _pag
-            current_w, current_h = _pag.size()
-        except Exception:
-            current_w = self.root.winfo_screenwidth()
-            current_h = self.root.winfo_screenheight()
-
-        with self.config_path.open("r", encoding="utf-8") as fh:
-            raw = json.load(fh)
-
-        base_w, base_h, scale_x, scale_y = apply_automatic_coordinate_calibration(
-            raw,
-            int(current_w),
-            int(current_h),
-        )
-        executor = raw.setdefault("executor", {})
-        baseline = raw["coordinate_baseline"]
-
-        if base_w == current_w and base_h == current_h:
-            # Save the rebuilt executor coordinates even when the scale is 1:1.
-            with self.config_path.open("w", encoding="utf-8") as fh:
-                json.dump(raw, fh, indent=2)
-                fh.write("\n")
-            messagebox.showinfo(
-                "Calibrar pantalla",
-                f"Las coordenadas ya están calibradas para {current_w}x{current_h}.",
-            )
-            return
-
-        scale_x = current_w / base_w
-        scale_y = current_h / base_h
-        if not messagebox.askyesno(
-            "Calibrar pantalla",
-            f"Pantalla detectada: {current_w}x{current_h}\n"
-            f"Baseline: {base_w}x{base_h}\n"
-            f"Factor X: {scale_x:.4f}  |  Factor Y: {scale_y:.4f}\n\n"
-            "¿Aplicar reescalado a todas las coordenadas?",
-        ):
-            return
-
-        _NON_COORD = {"order_scan_rows"}
-        new_coords: dict[str, Any] = {}
-        for key, val in baseline.get("order_form_coordinates", {}).items():
-            if key in _NON_COORD or not isinstance(val, list) or len(val) != 2:
-                new_coords[key] = val
-            else:
-                new_coords[key] = [round(val[0] * scale_x), round(val[1] * scale_y)]
-
-        executor["order_form_coordinates"] = new_coords
-
-        base_btn = baseline.get("new_order_button")
-        if isinstance(base_btn, list) and len(base_btn) == 2:
-            executor["new_order_button"] = [round(base_btn[0] * scale_x), round(base_btn[1] * scale_y)]
-
-        with self.config_path.open("w", encoding="utf-8") as fh:
-            json.dump(raw, fh, indent=2)
-            fh.write("\n")
-
-        self.config = load_config(self.config_path)
-        self.logger.info(
-            "Coordinates calibrated %sx%s → %sx%s scale_x=%.4f scale_y=%.4f",
-            base_w, base_h, current_w, current_h, scale_x, scale_y,
-        )
-        messagebox.showinfo(
-            "Calibrar pantalla",
-            f"Coordenadas actualizadas para {current_w}x{current_h}.",
-        )
-
     def _save_poll_seconds(self) -> None:
         try:
             value = float(self.poll_seconds_var.get().replace(",", "."))
@@ -802,3 +685,4 @@ def run_ui(config_path: Path = DEFAULT_CONFIG_PATH) -> None:
     root = tk.Tk()
     CopyMonitorApp(root, config_path)
     root.mainloop()
+
