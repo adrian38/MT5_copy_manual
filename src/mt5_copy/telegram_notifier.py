@@ -45,6 +45,8 @@ class TelegramNotifier:
 
     def stop(self) -> None:
         if self.worker and self.worker.is_alive():
+            with self.queue.mutex:
+                self.queue.queue.clear()
             self.queue.put(None)
 
     def send(self, message: str) -> None:
