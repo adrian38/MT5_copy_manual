@@ -3,12 +3,22 @@ from __future__ import annotations
 import logging
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .csv_reader import read_csv_rows
 from .mapping import load_mapping, upsert_mapping
 from .models import ChangeEvent, ChangeType
 from .mt5_gui import GuiConfig, GuiSafetyError, Mt5GuiController
+from .operation_registry import (
+    MAX_OPERATION_ATTEMPTS,
+    OperationErrorRecord,
+    is_operation_discarded,
+    mark_operation_error,
+)
+
+
+class OperationAttemptError(RuntimeError):
+    pass
 
 
 class DryRunExecutor:
@@ -39,6 +49,8 @@ class PyAutoGuiExecutor:
         source_orders_file: Path | None = None,
         destination_orders_file: Path | None = None,
         destination_positions_file: Path | None = None,
+        operation_error_file: Path | None = None,
+        on_operation_error: Callable[[OperationErrorRecord], None] | None = None,
     ) -> None:
         self.gui = gui
         self.logger = logger
@@ -46,22 +58,32 @@ class PyAutoGuiExecutor:
         self.source_orders_file = source_orders_file
         self.destination_orders_file = destination_orders_file
         self.destination_positions_file = destination_positions_file
+        self.operation_error_file = operation_error_file
+        self.on_operation_error = on_operation_error
 
     def handle(self, event: ChangeEvent) -> None:
+        if is_operation_discarded(self.operation_error_file, source_ticket=event.source_ticket):
+            self.logger.error(
+                "Event ignored because operation is discarded after max failures source_ticket=%s event=%s",
+                event.source_ticket,
+                event.change_type.value,
+            )
+            return
+
         if event.change_type == ChangeType.ORDER_CREATED:
-            self._prepare_order_created(event)
+            self._run_event_with_retries("create_order", event, self._prepare_order_created)
             return
 
         if event.change_type == ChangeType.ORDER_DELETED:
-            self._delete_order(event)
+            self._run_event_with_retries("delete_order", event, self._delete_order)
             return
 
         if event.change_type == ChangeType.POSITION_OPENED:
-            self._prepare_market_position(event)
+            self._run_event_with_retries("create_position", event, self._prepare_market_position)
             return
 
         if event.change_type == ChangeType.POSITION_CLOSED:
-            self._close_position(event)
+            self._run_event_with_retries("close_position", event, self._close_position)
             return
 
         if event.change_type in {
@@ -72,6 +94,84 @@ class PyAutoGuiExecutor:
             return
 
         self.logger.warning("Unhandled event type for GUI executor: %s", event.change_type)
+
+    def _run_event_with_retries(
+        self,
+        operation: str,
+        event: ChangeEvent,
+        action: Callable[[ChangeEvent], None],
+    ) -> None:
+        last_error = ""
+        for attempt in range(1, MAX_OPERATION_ATTEMPTS + 1):
+            try:
+                action(event)
+                return
+            except OperationAttemptError as exc:
+                last_error = str(exc)
+                self.logger.error(
+                    "%s failed attempt=%s/%s source_ticket=%s reason=%s",
+                    operation,
+                    attempt,
+                    MAX_OPERATION_ATTEMPTS,
+                    event.source_ticket,
+                    last_error,
+                )
+            except Exception as exc:
+                last_error = str(exc)
+                self.logger.exception(
+                    "%s crashed attempt=%s/%s source_ticket=%s",
+                    operation,
+                    attempt,
+                    MAX_OPERATION_ATTEMPTS,
+                    event.source_ticket,
+                )
+
+        self._mark_event_error(operation, event, last_error or "unknown failure")
+
+    def _mark_event_error(self, operation: str, event: ChangeEvent, reason: str) -> None:
+        if self.operation_error_file is None:
+            return
+        row = event.current or event.previous or {}
+        destination_ticket = ""
+        if self.mapping_file is not None:
+            map_row = load_mapping(self.mapping_file).get(str(event.source_ticket))
+            if map_row:
+                destination_ticket = str(map_row.get("destination_ticket", ""))
+                updated = dict(map_row)
+                updated["status"] = "error"
+                upsert_mapping(self.mapping_file, updated)
+            else:
+                upsert_mapping(
+                    self.mapping_file,
+                    {
+                        "source_ticket": event.source_ticket,
+                        "destination_ticket": "",
+                        "symbol": row.get("symbol", event.symbol),
+                        "type": row.get("type", event.trade_type),
+                        "source_volume": row.get("volume", row.get("volume_current", row.get("volume_initial", ""))),
+                        "destination_volume": "",
+                        "status": "error",
+                    },
+                )
+
+        mark_operation_error(
+            self.operation_error_file,
+            operation=operation,
+            source_ticket=event.source_ticket,
+            destination_ticket=destination_ticket,
+            symbol=row.get("symbol", event.symbol),
+            trade_type=row.get("type", event.trade_type),
+            reason=reason,
+            notify=self.on_operation_error,
+        )
+        self.logger.error(
+            "Operation discarded after %s attempts operation=%s source_ticket=%s destination_ticket=%s reason=%s",
+            MAX_OPERATION_ATTEMPTS,
+            operation,
+            event.source_ticket,
+            destination_ticket,
+            reason,
+        )
 
     def _prepare_order_created(self, event: ChangeEvent) -> None:
         if not event.current:
@@ -106,9 +206,8 @@ class PyAutoGuiExecutor:
                 },
             )
         elif self.mapping_file is not None:
-            self.logger.error(
-                "ORDER_CREATED executed but destination ticket was not verified source_ticket=%s",
-                event.source_ticket,
+            raise OperationAttemptError(
+                f"ORDER_CREATED executed but destination ticket was not verified source_ticket={event.source_ticket}"
             )
 
         self.logger.info(
@@ -216,9 +315,8 @@ class PyAutoGuiExecutor:
                 },
             )
         elif self.mapping_file is not None:
-            self.logger.error(
-                "POSITION_OPENED executed but destination ticket was not verified source_ticket=%s",
-                event.source_ticket,
+            raise OperationAttemptError(
+                f"POSITION_OPENED executed but destination ticket was not verified source_ticket={event.source_ticket}"
             )
 
         self.logger.info(
@@ -244,8 +342,7 @@ class PyAutoGuiExecutor:
         mapping = load_mapping(self.mapping_file)
         map_row = mapping.get(str(event.source_ticket))
         if not map_row:
-            self.logger.warning("POSITION_CLOSED has no destination mapping source_ticket=%s", event.source_ticket)
-            return
+            raise OperationAttemptError(f"POSITION_CLOSED has no destination mapping source_ticket={event.source_ticket}")
         if map_row.get("status") != "placed":
             self.logger.info(
                 "POSITION_CLOSED skipped because mapping status is not placed source_ticket=%s status=%s",
@@ -256,8 +353,9 @@ class PyAutoGuiExecutor:
 
         destination_ticket = str(map_row.get("destination_ticket", ""))
         if not destination_ticket:
-            self.logger.warning("POSITION_CLOSED mapping has no destination ticket source_ticket=%s", event.source_ticket)
-            return
+            raise OperationAttemptError(
+                f"POSITION_CLOSED mapping has no destination ticket source_ticket={event.source_ticket}"
+            )
 
         current_tickets = self._destination_position_tickets()
         if destination_ticket not in current_tickets:
@@ -273,12 +371,10 @@ class PyAutoGuiExecutor:
 
         row_center = self._visible_position_row_center(destination_ticket)
         if row_center is None:
-            self.logger.error(
-                "POSITION_CLOSED refused: exact destination position row is not visible/current source_ticket=%s destination_ticket=%s",
-                event.source_ticket,
-                destination_ticket,
+            raise OperationAttemptError(
+                "POSITION_CLOSED refused: exact destination position row is not visible/current "
+                f"source_ticket={event.source_ticket} destination_ticket={destination_ticket}"
             )
-            return
 
         screenshot = self.gui.close_position(
             destination_ticket,
@@ -301,13 +397,10 @@ class PyAutoGuiExecutor:
                 time.sleep(self.gui.config.order_window_delay_seconds)
 
             if destination_ticket in self._destination_position_tickets():
-                self.logger.error(
-                    "POSITION_CLOSED did not remove destination_ticket=%s source_ticket=%s screenshot=%s",
-                    destination_ticket,
-                    event.source_ticket,
-                    screenshot,
+                raise OperationAttemptError(
+                    "POSITION_CLOSED did not remove destination_ticket="
+                    f"{destination_ticket} source_ticket={event.source_ticket} screenshot={screenshot}"
                 )
-                return
 
         updated = dict(map_row)
         updated["status"] = "closed"
@@ -337,11 +430,7 @@ class PyAutoGuiExecutor:
         mapping = load_mapping(self.mapping_file)
         map_row = mapping.get(str(event.source_ticket))
         if not map_row:
-            self.logger.warning(
-                "ORDER_DELETED has no destination mapping source_ticket=%s",
-                event.source_ticket,
-            )
-            return
+            raise OperationAttemptError(f"ORDER_DELETED has no destination mapping source_ticket={event.source_ticket}")
 
         if map_row.get("status") != "placed":
             self.logger.info(
@@ -355,21 +444,17 @@ class PyAutoGuiExecutor:
         destination_ticket = str(map_row.get("destination_ticket", ""))
         row_center = self._visible_order_row_center(destination_ticket)
         if row_center is None:
-            self.logger.warning(
-                "ORDER_DELETED skipped because destination ticket is not visible/current source_ticket=%s destination_ticket=%s",
-                event.source_ticket,
-                destination_ticket,
+            raise OperationAttemptError(
+                "ORDER_DELETED skipped because destination ticket is not visible/current "
+                f"source_ticket={event.source_ticket} destination_ticket={destination_ticket}"
             )
-            return
 
         destination_row = self._destination_order_row(destination_ticket)
         if destination_row is None:
-            self.logger.warning(
-                "ORDER_DELETED skipped because destination row is missing source_ticket=%s destination_ticket=%s",
-                event.source_ticket,
-                destination_ticket,
+            raise OperationAttemptError(
+                f"ORDER_DELETED skipped because destination row is missing source_ticket={event.source_ticket} "
+                f"destination_ticket={destination_ticket}"
             )
-            return
 
         active_source = self._find_active_source_order_matching_destination(
             destination_row,
@@ -403,13 +488,10 @@ class PyAutoGuiExecutor:
         source_row = event.previous or {}
         mismatches = _order_field_mismatches(source_row, destination_row)
         if mismatches:
-            self.logger.warning(
-                "ORDER_DELETED skipped because mapped destination does not match deleted source source_ticket=%s destination_ticket=%s mismatches=%s",
-                event.source_ticket,
-                destination_ticket,
-                mismatches,
+            raise OperationAttemptError(
+                "ORDER_DELETED skipped because mapped destination does not match deleted source "
+                f"source_ticket={event.source_ticket} destination_ticket={destination_ticket} mismatches={mismatches}"
             )
-            return
 
         screenshot = self.gui.delete_pending_order(destination_ticket, row_center=row_center)
         updated = dict(map_row)
@@ -786,6 +868,8 @@ def build_executor(
     destination_orders_file: Path | None = None,
     destination_positions_file: Path | None = None,
     source_orders_file: Path | None = None,
+    operation_error_file: Path | None = None,
+    on_operation_error: Callable[[OperationErrorRecord], None] | None = None,
 ):
     if mode == "pyautogui" and pyautogui_enabled:
         if executor_settings is None or project_root is None:
@@ -798,5 +882,7 @@ def build_executor(
             source_orders_file=source_orders_file,
             destination_orders_file=destination_orders_file,
             destination_positions_file=destination_positions_file,
+            operation_error_file=operation_error_file,
+            on_operation_error=on_operation_error,
         )
     return DryRunExecutor(logger)

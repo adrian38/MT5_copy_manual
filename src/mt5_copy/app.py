@@ -18,12 +18,14 @@ if __package__ in {None, ""}:
     from src.mt5_copy.logging_setup import setup_logging
     from src.mt5_copy.mapping import ensure_mapping_file
     from src.mt5_copy.models import ChangeEvent, ChangeType
+    from src.mt5_copy.operation_registry import OperationErrorRecord, operation_error_path
     from src.mt5_copy.reconciler import (
         reconcile_orders_to_source_authority,
         reconcile_positions_to_source_authority,
         reconcile_sl_tp,
     )
     from src.mt5_copy.state import load_state, save_state
+    from src.mt5_copy.telegram_notifier import TelegramNotifier, telegram_config_from_settings
 else:
     from .config import PROJECT_ROOT
     from .config import DEFAULT_CONFIG_PATH, load_config
@@ -34,12 +36,14 @@ else:
     from .logging_setup import setup_logging
     from .mapping import ensure_mapping_file
     from .models import ChangeEvent, ChangeType
+    from .operation_registry import OperationErrorRecord, operation_error_path
     from .reconciler import (
         reconcile_orders_to_source_authority,
         reconcile_positions_to_source_authority,
         reconcile_sl_tp,
     )
     from .state import load_state, save_state
+    from .telegram_notifier import TelegramNotifier, telegram_config_from_settings
 
 
 def run_once(
@@ -51,6 +55,8 @@ def run_once(
     config = load_config(config_path)
     logger = setup_logging(config.app_log_file, config.log_level)
     ensure_mapping_file(config.mapping_file)
+    operation_errors = operation_error_path(PROJECT_ROOT)
+    on_operation_error = _operation_error_notifier(config.notifications, logger)
 
     previous_state = load_state(config.state_file)
     positions = rows_to_snapshot(read_csv_rows(config.positions_file))
@@ -94,6 +100,8 @@ def run_once(
         source_orders_file=config.orders_file,
         destination_orders_file=config.destination_orders_file,
         destination_positions_file=config.destination_positions_file,
+        operation_error_file=operation_errors,
+        on_operation_error=on_operation_error,
     )
 
     for event in events:
@@ -122,6 +130,8 @@ def run_once(
                 gui=gui,
                 logger=logger,
                 issue_scope=sl_tp_scope,
+                operation_error_file=operation_errors,
+                on_operation_error=on_operation_error,
             )
             if remaining:
                 logger.warning("SL/TP reconcile remaining scope=%s issues=%s", sl_tp_scope, remaining)
@@ -140,6 +150,8 @@ def run_once(
                 mapping_file=config.mapping_file,
                 gui=gui,
                 logger=logger,
+                operation_error_file=operation_errors,
+                on_operation_error=on_operation_error,
             )
             if report.created or report.deleted or report.skipped or report.missing_sources or report.extra_destinations:
                 logger.info("AUTHORITY_SYNC report=%s", report)
@@ -150,6 +162,8 @@ def run_once(
                 mapping_file=config.mapping_file,
                 gui=gui,
                 logger=logger,
+                operation_error_file=operation_errors,
+                on_operation_error=on_operation_error,
             )
             if (
                 position_report.created
@@ -169,6 +183,28 @@ def run_once(
         heartbeat,
     )
     return len(events)
+
+
+def _operation_error_notifier(notifications: dict, logger) -> callable:
+    def notify(record: OperationErrorRecord) -> None:
+        message = (
+            "ERROR OPERACION DESCARTADA\n"
+            f"Operacion: {record.operation}\n"
+            f"Source ticket: {record.source_ticket or '-'}\n"
+            f"Destination ticket: {record.destination_ticket or '-'}\n"
+            f"Symbol: {record.symbol or '-'}\n"
+            f"Type: {record.trade_type or '-'}\n"
+            f"Intentos: {record.attempts}\n"
+            f"Motivo: {record.reason}\n"
+            "La app no volvera a actuar sobre esta operacion hasta revision manual."
+        )
+        try:
+            notifier = TelegramNotifier(telegram_config_from_settings(notifications))
+            notifier.send_forced(message)
+        except Exception:
+            logger.exception("Forced Telegram notification failed for discarded operation.")
+
+    return notify
 
 
 def _authority_sync_flags(events: list[ChangeEvent], scope: str) -> tuple[bool, bool]:
@@ -234,6 +270,7 @@ def run_reconcile(config_path: Path = DEFAULT_CONFIG_PATH) -> None:
     config = load_config(config_path)
     logger = setup_logging(config.app_log_file, config.log_level)
     gui = build_gui_controller(config.executor, PROJECT_ROOT, logger)
+    operation_errors = operation_error_path(PROJECT_ROOT)
     remaining = reconcile_sl_tp(
         source_positions_file=config.positions_file,
         source_orders_file=config.orders_file,
@@ -242,6 +279,8 @@ def run_reconcile(config_path: Path = DEFAULT_CONFIG_PATH) -> None:
         mapping_file=config.mapping_file,
         gui=gui,
         logger=logger,
+        operation_error_file=operation_errors,
+        on_operation_error=_operation_error_notifier(config.notifications, logger),
     )
     print(json.dumps([issue.__dict__ for issue in remaining], indent=2, sort_keys=True))
 

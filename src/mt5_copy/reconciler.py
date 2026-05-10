@@ -4,11 +4,17 @@ import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .csv_reader import read_csv_rows, rows_to_snapshot
 from .mapping import load_mapping, upsert_mapping
 from .mt5_gui import Mt5GuiController
+from .operation_registry import (
+    MAX_OPERATION_ATTEMPTS,
+    OperationErrorRecord,
+    is_operation_discarded,
+    mark_operation_error,
+)
 
 
 @dataclass(frozen=True)
@@ -61,6 +67,8 @@ def reconcile_orders_to_source_authority(
     logger: logging.Logger,
     verify_delay_seconds: float = 1.5,
     before_delete_check=None,
+    operation_error_file: Path | None = None,
+    on_operation_error: Callable[[OperationErrorRecord], None] | None = None,
 ) -> AuthoritySyncReport:
     source_rows = _pending_order_rows(read_csv_rows(source_orders_file))
     destination_rows = _pending_order_rows(read_csv_rows(destination_orders_file))
@@ -72,14 +80,17 @@ def reconcile_orders_to_source_authority(
 
     source_counts = _signature_counts(source_rows)
     destination_counts = _signature_counts(destination_rows)
-    missing_sources = _surplus_source_tickets(source_rows, source_counts, destination_counts)
+    missing_sources = [
+        ticket
+        for ticket in _surplus_source_tickets(source_rows, source_counts, destination_counts)
+        if not is_operation_discarded(operation_error_file, source_ticket=ticket)
+    ]
     mapping = load_mapping(mapping_file)
-    extra_destinations = _surplus_destination_tickets(
-        destination_rows,
-        source_counts,
-        destination_counts,
-        mapping,
-    )
+    extra_destinations = [
+        ticket
+        for ticket in _surplus_destination_tickets(destination_rows, source_counts, destination_counts, mapping)
+        if not is_operation_discarded(operation_error_file, destination_ticket=ticket)
+    ]
 
     created = 0
     deleted = 0
@@ -95,18 +106,43 @@ def reconcile_orders_to_source_authority(
             )
             continue
 
-        before_tickets = {
-            str(row.get("ticket", ""))
-            for row in _pending_order_rows(read_csv_rows(destination_orders_file))
-        }
-        logger.info("AUTHORITY_SYNC creating missing order source_ticket=%s", source_ticket)
-        gui.prepare_pending_order(source)
-        time.sleep(verify_delay_seconds)
-        refreshed = _pending_order_rows(read_csv_rows(destination_orders_file))
-        created_ticket = _find_new_matching_destination_ticket(source, refreshed, before_tickets)
+        created_ticket = None
+        refreshed: list[dict[str, Any]] = []
+        last_reason = "destination_ticket_not_found"
+        for attempt in range(1, MAX_OPERATION_ATTEMPTS + 1):
+            before_tickets = {
+                str(row.get("ticket", ""))
+                for row in _pending_order_rows(read_csv_rows(destination_orders_file))
+            }
+            logger.info(
+                "AUTHORITY_SYNC creating missing order source_ticket=%s attempt=%s/%s",
+                source_ticket,
+                attempt,
+                MAX_OPERATION_ATTEMPTS,
+            )
+            try:
+                gui.prepare_pending_order(source)
+                time.sleep(verify_delay_seconds)
+                refreshed = _pending_order_rows(read_csv_rows(destination_orders_file))
+                created_ticket = _find_new_matching_destination_ticket(source, refreshed, before_tickets)
+                if created_ticket is not None:
+                    break
+                logger.error("AUTHORITY_SYNC create could not verify destination ticket source_ticket=%s", source_ticket)
+            except Exception as exc:
+                last_reason = str(exc)
+                logger.exception("AUTHORITY_SYNC create failed source_ticket=%s attempt=%s", source_ticket, attempt)
         if created_ticket is None:
-            skipped.append(f"create:{source_ticket}:destination_ticket_not_found")
-            logger.error("AUTHORITY_SYNC create could not verify destination ticket source_ticket=%s", source_ticket)
+            skipped.append(f"create:{source_ticket}:error")
+            _mark_authority_error(
+                operation_error_file,
+                on_operation_error,
+                operation="create_order",
+                source_ticket=source_ticket,
+                symbol=source.get("symbol", ""),
+                trade_type=source.get("type", ""),
+                reason=last_reason,
+                mapping_file=mapping_file,
+            )
             continue
 
         destination = {str(row.get("ticket", "")): row for row in refreshed}[created_ticket]
@@ -162,16 +198,40 @@ def reconcile_orders_to_source_authority(
             )
             continue
 
-        row_center = _row_center_for_destination_ticket(destination_ticket, refreshed, gui)
-        logger.info("AUTHORITY_SYNC deleting extra destination_ticket=%s", destination_ticket)
-        gui.delete_pending_order(destination_ticket, row_center=row_center)
-        time.sleep(verify_delay_seconds)
-        if destination_ticket in {
-            str(row.get("ticket", ""))
-            for row in _pending_order_rows(read_csv_rows(destination_orders_file))
-        }:
-            skipped.append(f"delete:{destination_ticket}:still_present")
+        last_reason = "still_present"
+        for attempt in range(1, MAX_OPERATION_ATTEMPTS + 1):
+            row_center = _row_center_for_destination_ticket(destination_ticket, refreshed, gui)
+            logger.info(
+                "AUTHORITY_SYNC deleting extra destination_ticket=%s attempt=%s/%s",
+                destination_ticket,
+                attempt,
+                MAX_OPERATION_ATTEMPTS,
+            )
+            try:
+                gui.delete_pending_order(destination_ticket, row_center=row_center)
+                time.sleep(verify_delay_seconds)
+            except Exception as exc:
+                last_reason = str(exc)
+                logger.exception("AUTHORITY_SYNC delete failed destination_ticket=%s attempt=%s", destination_ticket, attempt)
+            if destination_ticket not in {
+                str(row.get("ticket", ""))
+                for row in _pending_order_rows(read_csv_rows(destination_orders_file))
+            }:
+                break
+            refreshed = _pending_order_rows(read_csv_rows(destination_orders_file))
             logger.error("AUTHORITY_SYNC delete did not remove destination_ticket=%s", destination_ticket)
+        else:
+            skipped.append(f"delete:{destination_ticket}:error")
+            _mark_authority_error(
+                operation_error_file,
+                on_operation_error,
+                operation="delete_order",
+                destination_ticket=destination_ticket,
+                symbol=destination.get("symbol", ""),
+                trade_type=destination.get("type", ""),
+                reason=last_reason,
+                mapping_file=mapping_file,
+            )
             continue
 
         _mark_destination_canceled(mapping_file, destination_ticket)
@@ -195,12 +255,22 @@ def reconcile_positions_to_source_authority(
     gui: Mt5GuiController,
     logger: logging.Logger,
     verify_delay_seconds: float = 1.5,
+    operation_error_file: Path | None = None,
+    on_operation_error: Callable[[OperationErrorRecord], None] | None = None,
 ) -> PositionSyncReport:
     source_rows = read_csv_rows(source_positions_file)
     destination_rows = read_csv_rows(destination_positions_file)
     mapping = load_mapping(mapping_file)
-    missing_sources = _surplus_position_source_tickets(source_rows, destination_rows)
-    extra_destinations = _surplus_position_destination_tickets(source_rows, destination_rows, mapping)
+    missing_sources = [
+        ticket
+        for ticket in _surplus_position_source_tickets(source_rows, destination_rows)
+        if not is_operation_discarded(operation_error_file, source_ticket=ticket)
+    ]
+    extra_destinations = [
+        ticket
+        for ticket in _surplus_position_destination_tickets(source_rows, destination_rows, mapping)
+        if not is_operation_discarded(operation_error_file, destination_ticket=ticket)
+    ]
     before_tickets = {str(row.get("ticket", "")) for row in destination_rows}
     created = 0
     deleted = 0
@@ -227,16 +297,45 @@ def reconcile_positions_to_source_authority(
             )
             continue
 
-        logger.info("AUTHORITY_SYNC creating missing market position source_ticket=%s", source_ticket)
-        gui.prepare_market_position(source)
-        time.sleep(verify_delay_seconds)
-        refreshed = read_csv_rows(destination_positions_file)
-        destination_ticket = _find_new_matching_position_ticket(source, refreshed, before_tickets)
-        if destination_ticket is None:
-            skipped.append(f"create_position:{source_ticket}:destination_ticket_not_found")
-            logger.error(
-                "AUTHORITY_SYNC position create could not verify destination ticket source_ticket=%s",
+        destination_ticket = None
+        refreshed: list[dict[str, Any]] = []
+        last_reason = "destination_ticket_not_found"
+        for attempt in range(1, MAX_OPERATION_ATTEMPTS + 1):
+            logger.info(
+                "AUTHORITY_SYNC creating missing market position source_ticket=%s attempt=%s/%s",
                 source_ticket,
+                attempt,
+                MAX_OPERATION_ATTEMPTS,
+            )
+            try:
+                gui.prepare_market_position(source)
+                time.sleep(verify_delay_seconds)
+                refreshed = read_csv_rows(destination_positions_file)
+                destination_ticket = _find_new_matching_position_ticket(source, refreshed, before_tickets)
+                if destination_ticket is not None:
+                    break
+                logger.error(
+                    "AUTHORITY_SYNC position create could not verify destination ticket source_ticket=%s",
+                    source_ticket,
+                )
+            except Exception as exc:
+                last_reason = str(exc)
+                logger.exception(
+                    "AUTHORITY_SYNC position create failed source_ticket=%s attempt=%s",
+                    source_ticket,
+                    attempt,
+                )
+        if destination_ticket is None:
+            skipped.append(f"create_position:{source_ticket}:error")
+            _mark_authority_error(
+                operation_error_file,
+                on_operation_error,
+                operation="create_position",
+                source_ticket=source_ticket,
+                symbol=source.get("symbol", ""),
+                trade_type=source.get("type", ""),
+                reason=last_reason,
+                mapping_file=mapping_file,
             )
             continue
 
@@ -308,16 +407,43 @@ def reconcile_positions_to_source_authority(
             )
             continue
 
-        logger.info("AUTHORITY_SYNC closing extra market position destination_ticket=%s", destination_ticket)
-        gui.close_position(
-            destination_ticket,
-            row_center=row_center,
-            trade_type=str(destination.get("type", "")),
-        )
-        time.sleep(verify_delay_seconds)
-        if destination_ticket in {str(row.get("ticket", "")) for row in read_csv_rows(destination_positions_file)}:
-            skipped.append(f"close_position:{destination_ticket}:still_present")
+        last_reason = "still_present"
+        for attempt in range(1, MAX_OPERATION_ATTEMPTS + 1):
+            logger.info(
+                "AUTHORITY_SYNC closing extra market position destination_ticket=%s attempt=%s/%s",
+                destination_ticket,
+                attempt,
+                MAX_OPERATION_ATTEMPTS,
+            )
+            try:
+                gui.close_position(
+                    destination_ticket,
+                    row_center=row_center,
+                    trade_type=str(destination.get("type", "")),
+                )
+                time.sleep(verify_delay_seconds)
+            except Exception as exc:
+                last_reason = str(exc)
+                logger.exception(
+                    "AUTHORITY_SYNC position close failed destination_ticket=%s attempt=%s",
+                    destination_ticket,
+                    attempt,
+                )
+            if destination_ticket not in {str(row.get("ticket", "")) for row in read_csv_rows(destination_positions_file)}:
+                break
             logger.error("AUTHORITY_SYNC position close did not remove destination_ticket=%s", destination_ticket)
+        else:
+            skipped.append(f"close_position:{destination_ticket}:error")
+            _mark_authority_error(
+                operation_error_file,
+                on_operation_error,
+                operation="close_position",
+                destination_ticket=destination_ticket,
+                symbol=destination.get("symbol", ""),
+                trade_type=destination.get("type", ""),
+                reason=last_reason,
+                mapping_file=mapping_file,
+            )
             continue
 
         _mark_destination_closed(mapping_file, destination_ticket)
@@ -420,9 +546,11 @@ def reconcile_sl_tp(
     mapping_file: Path,
     gui: Mt5GuiController,
     logger: logging.Logger,
-    max_retries: int = 2,
+    max_retries: int = MAX_OPERATION_ATTEMPTS,
     verify_delay_seconds: float = 1.5,
     issue_scope: str = "all",
+    operation_error_file: Path | None = None,
+    on_operation_error: Callable[[OperationErrorRecord], None] | None = None,
 ) -> list[ReconcileIssue]:
     source_positions = rows_to_snapshot(read_csv_rows(source_positions_file))
     source_orders = rows_to_snapshot(read_csv_rows(source_orders_file))
@@ -434,6 +562,15 @@ def reconcile_sl_tp(
         issues.extend(find_order_discrepancies(source_orders, destination_orders, mapping))
     if issue_scope in {"all", "positions"}:
         issues.extend(find_position_discrepancies(source_positions, destination_positions, mapping))
+    issues = [
+        issue
+        for issue in issues
+        if not is_operation_discarded(
+            operation_error_file,
+            source_ticket=issue.source_ticket,
+            destination_ticket=issue.destination_ticket,
+        )
+    ]
 
     for issue in issues:
         if issue.issue_type not in {"order_sl_tp_mismatch", "position_sl_tp_mismatch"}:
@@ -442,6 +579,7 @@ def reconcile_sl_tp(
 
         is_position = issue.issue_type == "position_sl_tp_mismatch"
         source = source_positions[issue.source_ticket] if is_position else source_orders[issue.source_ticket]
+        last_reason = "sl_tp_mismatch_remains"
         for attempt in range(1, max_retries + 1):
             logger.info(
                 "Reconciling SL/TP attempt=%s source=%s destination=%s diffs=%s",
@@ -454,12 +592,13 @@ def reconcile_sl_tp(
                 destination_rows = read_csv_rows(destination_positions_file)
                 row_center = _row_center_for_position_ticket(issue.destination_ticket, destination_rows, gui)
                 if row_center is None:
+                    last_reason = "destination row is not visible/current"
                     logger.error(
                         "Refusing SL/TP position modify because destination row is not visible/current source=%s destination=%s",
                         issue.source_ticket,
                         issue.destination_ticket,
                     )
-                    break
+                    continue
                 try:
                     gui.modify_position_sl_tp(
                         issue.destination_ticket,
@@ -468,13 +607,14 @@ def reconcile_sl_tp(
                         row_center=row_center,
                     )
                 except Exception:
+                    last_reason = "GUI failed while reconciling position SL/TP"
                     logger.exception(
                         "GUI failed while reconciling position SL/TP source=%s destination=%s",
                         issue.source_ticket,
                         issue.destination_ticket,
                     )
                     _dismiss_gui_dialog(gui, logger)
-                    break
+                    continue
             else:
                 try:
                     gui.modify_pending_order_sl_tp(
@@ -483,13 +623,14 @@ def reconcile_sl_tp(
                         tp=source.get("tp", ""),
                     )
                 except Exception:
+                    last_reason = "GUI failed while reconciling order SL/TP"
                     logger.exception(
                         "GUI failed while reconciling order SL/TP source=%s destination=%s",
                         issue.source_ticket,
                         issue.destination_ticket,
                     )
                     _dismiss_gui_dialog(gui, logger)
-                    break
+                    continue
             time.sleep(verify_delay_seconds)
 
             refreshed_file = destination_positions_file if is_position else destination_orders_file
@@ -508,6 +649,17 @@ def reconcile_sl_tp(
                 issue.source_ticket,
                 issue.destination_ticket,
             )
+            _mark_authority_error(
+                operation_error_file,
+                on_operation_error,
+                operation="update_position" if is_position else "update_order",
+                source_ticket=issue.source_ticket,
+                destination_ticket=issue.destination_ticket,
+                symbol=source.get("symbol", ""),
+                trade_type=source.get("type", ""),
+                reason=last_reason,
+                mapping_file=mapping_file,
+            )
 
     refreshed_source_positions = rows_to_snapshot(read_csv_rows(source_positions_file))
     refreshed_source = rows_to_snapshot(read_csv_rows(source_orders_file))
@@ -524,6 +676,15 @@ def reconcile_sl_tp(
                 mapping,
             )
         )
+    remaining = [
+        issue
+        for issue in remaining
+        if not is_operation_discarded(
+            operation_error_file,
+            source_ticket=issue.source_ticket,
+            destination_ticket=issue.destination_ticket,
+        )
+    ]
     return remaining
 
 
@@ -549,6 +710,36 @@ def _dismiss_gui_dialog(gui: Mt5GuiController, logger: logging.Logger) -> None:
         gui.close_active_dialog()
     except Exception:
         logger.exception("Failed to dismiss GUI dialog after reconciliation error.")
+
+
+def _mark_authority_error(
+    operation_error_file: Path | None,
+    on_operation_error: Callable[[OperationErrorRecord], None] | None,
+    *,
+    operation: str,
+    source_ticket: Any = "",
+    destination_ticket: Any = "",
+    symbol: Any = "",
+    trade_type: Any = "",
+    reason: str,
+    mapping_file: Path,
+) -> None:
+    if source_ticket:
+        _mark_source_error(mapping_file, str(source_ticket))
+    if destination_ticket:
+        _mark_destination_error(mapping_file, str(destination_ticket))
+    if operation_error_file is None:
+        return
+    mark_operation_error(
+        operation_error_file,
+        operation=operation,
+        source_ticket=source_ticket,
+        destination_ticket=destination_ticket,
+        symbol=symbol,
+        trade_type=trade_type,
+        reason=reason,
+        notify=on_operation_error,
+    )
 
 
 def _map_exact_matches(
@@ -874,6 +1065,39 @@ def _mark_destination_canceled(mapping_file: Path, destination_ticket: str) -> N
             continue
         updated = dict(row)
         updated["status"] = "canceled"
+        upsert_mapping(mapping_file, updated)
+        return
+
+
+def _mark_source_error(mapping_file: Path, source_ticket: str) -> None:
+    mapping = load_mapping(mapping_file)
+    row = mapping.get(str(source_ticket))
+    if row is None:
+        upsert_mapping(
+            mapping_file,
+            {
+                "source_ticket": source_ticket,
+                "destination_ticket": "",
+                "symbol": "",
+                "type": "",
+                "source_volume": "",
+                "destination_volume": "",
+                "status": "error",
+            },
+        )
+        return
+    updated = dict(row)
+    updated["status"] = "error"
+    upsert_mapping(mapping_file, updated)
+
+
+def _mark_destination_error(mapping_file: Path, destination_ticket: str) -> None:
+    mapping = load_mapping(mapping_file)
+    for row in mapping.values():
+        if str(row.get("destination_ticket", "")) != destination_ticket:
+            continue
+        updated = dict(row)
+        updated["status"] = "error"
         upsert_mapping(mapping_file, updated)
         return
 

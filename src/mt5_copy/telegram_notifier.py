@@ -56,6 +56,11 @@ class TelegramNotifier:
             return
         self.queue.put(message)
 
+    def send_forced(self, message: str) -> None:
+        if not self.config.bot_token or not self.config.chat_id:
+            return
+        self._send_now(message)
+
     def _run(self) -> None:
         while True:
             message = self.queue.get()
