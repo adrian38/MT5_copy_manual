@@ -1,7 +1,7 @@
 import unittest
 from pathlib import Path
 
-from src.mt5_copy.mt5_gui import GuiConfig, Mt5GuiController
+from src.mt5_copy.mt5_gui import GuiConfig, GuiSafetyError, Mt5GuiController
 
 
 class FakePyAutoGui:
@@ -160,6 +160,56 @@ class Mt5GuiActionsTest(unittest.TestCase):
         self.assertEqual(screenshot, Path("after_position_context_close_clicked.png"))
         self.assertIn(("rightClick", (180, 513)), gui.pyautogui.calls)
         self.assertIn(("click", _coords()["position_context_close"]), gui.pyautogui.calls)
+
+    def test_calibrates_toolbox_row_coordinates_from_visible_tickets(self):
+        class CalibratingGui(RecordingMt5GuiController):
+            def _locate_ticket_centers(self, tickets):
+                return {
+                    "10": (254, 600),
+                    "11": (254, 620),
+                    "20": (254, 660),
+                    "21": (254, 680),
+                }
+
+        gui = CalibratingGui(_config())
+
+        updates = gui.calibrate_toolbox_coordinates(
+            destination_positions=[{"ticket": "10"}, {"ticket": "11"}],
+            destination_orders=[{"ticket": "20"}, {"ticket": "21"}],
+        )
+
+        self.assertEqual(updates["position_row_anchor"], (254, 600))
+        self.assertEqual(updates["position_row_step_y"], (0, 20))
+        self.assertEqual(updates["position_row_max_y"], (0, 640))
+        self.assertEqual(updates["order_row_anchor"], (254, 660))
+        self.assertEqual(updates["order_row_step_y"], (0, 20))
+        self.assertEqual(updates["order_row_max_y"], (0, 700))
+        self.assertEqual(gui.config.order_form_coordinates["position_row_anchor"], (254, 600))
+
+    def test_calibrates_toolbox_even_without_visible_tickets(self):
+        gui = RecordingMt5GuiController(_config())
+
+        updates = gui.calibrate_toolbox_coordinates(
+            destination_positions=[],
+            destination_orders=[],
+        )
+
+        self.assertIn("position_row_anchor", updates)
+        self.assertIn("order_row_anchor", updates)
+        self.assertEqual(updates["position_row_step_y"], (0, 20))
+        self.assertEqual(updates["order_row_step_y"], (0, 20))
+        self.assertEqual(updates["position_row_max_y"], (0, 647))
+        self.assertEqual(updates["order_row_max_y"], (0, 647))
+
+    def test_calibration_requires_focused_mt5(self):
+        class UnfocusedGui(RecordingMt5GuiController):
+            def focus_mt5(self):
+                return False
+
+        gui = UnfocusedGui(_config())
+
+        with self.assertRaises(GuiSafetyError):
+            gui.calibrate_toolbox_coordinates([], [])
 
 
 def _config():

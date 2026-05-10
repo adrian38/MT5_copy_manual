@@ -11,7 +11,7 @@ from pathlib import Path
 from tkinter import ttk
 from typing import Any
 
-from .app import run_once
+from .app import calibrate_tracking_start, run_once
 from .config import AppConfig, DEFAULT_CONFIG_PATH, load_config
 from .csv_reader import read_csv_rows, read_latest_row
 from .logging_setup import setup_logging
@@ -50,6 +50,8 @@ class QueueLogHandler(logging.Handler):
         "Tracking started",
         "Tracking paused",
         "Tracking stop",
+        "Toolbox calibration",
+        "Calibrating MT5 toolbox",
         "Terminal route saved",
         "ERROR",
         "WARNING",
@@ -140,6 +142,7 @@ class CopyMonitorApp:
 
         self.stop_event.clear()
         self.pause_event.clear()
+        self._calibrate_tracking_start()
         self.worker = threading.Thread(target=self._worker_loop, name="copy-monitor", daemon=True)
         self.worker.start()
         self._set_mode("ACTIVO")
@@ -472,6 +475,16 @@ class CopyMonitorApp:
         self.config = load_config(self.config_path)
         self.poll_seconds_var.set(f"{self.config.poll_seconds:.1f}")
         self.logger.info("poll_seconds updated to %s", value)
+
+    def _calibrate_tracking_start(self) -> None:
+        self.logger.info("Calibrating MT5 toolbox coordinates before tracking start.")
+        updates = calibrate_tracking_start(self.config_path)
+        if updates:
+            self.config = load_config(self.config_path)
+            self.executor_var.set(self._executor_text())
+            self.logger.info("Toolbox calibration applied: %s", updates)
+        else:
+            self.logger.info("Toolbox calibration did not change coordinates.")
 
     def _drain_logs(self) -> None:
         while True:

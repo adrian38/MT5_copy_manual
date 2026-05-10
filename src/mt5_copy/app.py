@@ -18,6 +18,7 @@ if __package__ in {None, ""}:
     from src.mt5_copy.logging_setup import setup_logging
     from src.mt5_copy.mapping import ensure_mapping_file
     from src.mt5_copy.models import ChangeEvent, ChangeType
+    from src.mt5_copy.mt5_gui import GuiSafetyError
     from src.mt5_copy.operation_registry import OperationErrorRecord, operation_error_path
     from src.mt5_copy.reconciler import (
         reconcile_orders_to_source_authority,
@@ -36,6 +37,7 @@ else:
     from .logging_setup import setup_logging
     from .mapping import ensure_mapping_file
     from .models import ChangeEvent, ChangeType
+    from .mt5_gui import GuiSafetyError
     from .operation_registry import OperationErrorRecord, operation_error_path
     from .reconciler import (
         reconcile_orders_to_source_authority,
@@ -207,6 +209,52 @@ def _operation_error_notifier(notifications: dict, logger) -> callable:
     return notify
 
 
+def calibrate_tracking_start(config_path: Path = DEFAULT_CONFIG_PATH) -> dict[str, tuple[int, int]]:
+    config = load_config(config_path)
+    logger = setup_logging(config.app_log_file, config.log_level)
+    executor = config.executor
+    if (
+        str(executor.get("mode", "dry_run")) != "pyautogui"
+        or not bool(executor.get("pyautogui_enabled", False))
+        or not bool(executor.get("toolbox_calibration_enabled", True))
+    ):
+        return {}
+
+    try:
+        gui = build_gui_controller(executor, PROJECT_ROOT, logger)
+        updates = gui.calibrate_toolbox_coordinates(
+            destination_positions=read_csv_rows(config.destination_positions_file),
+            destination_orders=read_csv_rows(config.destination_orders_file),
+        )
+    except GuiSafetyError:
+        logger.exception("Toolbox coordinate calibration failed because MT5 could not be focused.")
+        raise
+    except Exception:
+        logger.exception("Toolbox coordinate calibration failed. Keeping configured coordinates.")
+        return {}
+
+    if not updates:
+        return {}
+
+    _save_executor_coordinate_updates(config_path, updates)
+    logger.info("Toolbox coordinate calibration saved to config: %s", updates)
+    return updates
+
+
+def _save_executor_coordinate_updates(
+    config_path: Path,
+    updates: dict[str, tuple[int, int]],
+) -> None:
+    with Path(config_path).open("r", encoding="utf-8") as fh:
+        raw = json.load(fh)
+    coordinates = raw.setdefault("executor", {}).setdefault("order_form_coordinates", {})
+    for key, value in updates.items():
+        coordinates[key] = [int(value[0]), int(value[1])]
+    with Path(config_path).open("w", encoding="utf-8") as fh:
+        json.dump(raw, fh, indent=2)
+        fh.write("\n")
+
+
 def _authority_sync_flags(events: list[ChangeEvent], scope: str) -> tuple[bool, bool]:
     if scope == "all":
         return True, True
@@ -289,6 +337,7 @@ def run_loop(config_path: Path = DEFAULT_CONFIG_PATH) -> None:
     config = load_config(config_path)
     logger = setup_logging(config.app_log_file, config.log_level)
     logger.info("Starting observer loop. Common Files: %s", config.common_files_path)
+    calibrate_tracking_start(config_path)
 
     while True:
         try:

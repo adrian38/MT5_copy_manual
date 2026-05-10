@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from statistics import median
 
 
 class GuiDependencyError(RuntimeError):
@@ -126,6 +127,36 @@ class Mt5GuiController:
             str(image_path),
             confidence=self.config.image_confidence,
         )
+
+    def calibrate_toolbox_coordinates(
+        self,
+        destination_positions: list[dict[str, Any]],
+        destination_orders: list[dict[str, Any]],
+    ) -> dict[str, tuple[int, int]]:
+        self.logger.info("Focusing MT5 target before toolbox calibration.")
+        focused = self.focus_mt5()
+        if not focused:
+            raise GuiSafetyError("Cannot calibrate toolbox because MT5 target was not focused.")
+
+        tickets = [
+            str(row.get("ticket", "")).strip()
+            for row in [*destination_positions, *destination_orders]
+            if str(row.get("ticket", "")).strip()
+        ]
+        ticket_centers = self._locate_ticket_centers(tickets) if tickets else {}
+
+        updates: dict[str, tuple[int, int]] = {}
+        updates.update(self._calibrate_row_group("position", destination_positions, ticket_centers))
+        updates.update(self._calibrate_row_group("order", destination_orders, ticket_centers))
+        if not updates:
+            updates = self._fallback_toolbox_coordinates()
+            self.logger.warning(
+                "Toolbox calibration used fallback geometry because no destination tickets were available/readable."
+            )
+
+        self.config.order_form_coordinates.update(updates)
+        self.logger.info("Toolbox coordinates calibrated: %s", updates)
+        return updates
 
     def click_image(self, image_name: str) -> bool:
         self._require_armed("click image")
@@ -738,20 +769,100 @@ class Mt5GuiController:
 
     def _locate_ticket_center(self, destination_ticket: str) -> tuple[int, int] | None:
         ticket = str(destination_ticket)
+        centers = self._locate_ticket_centers([ticket])
+        if ticket in centers:
+            return centers[ticket]
+        return self._known_visible_order_rows().get(ticket)
+
+    def _locate_ticket_centers(self, tickets: list[str]) -> dict[str, tuple[int, int]]:
+        wanted = {str(ticket).strip() for ticket in tickets if str(ticket).strip()}
+        if not wanted:
+            return {}
         screenshot = self.pyautogui.screenshot()
         try:
             import pytesseract  # type: ignore
         except ImportError:
-            # Fallback for the current fixed toolbox layout: use row order by visible ticket list.
-            return self._known_visible_order_rows().get(ticket)
+            return {}
 
+        centers: dict[str, tuple[int, int]] = {}
         text = pytesseract.image_to_data(screenshot, output_type=pytesseract.Output.DICT)
         for index, value in enumerate(text.get("text", [])):
-            if str(value).strip() == ticket:
+            ticket = str(value).strip()
+            if ticket in wanted:
                 x = int(text["left"][index] + text["width"][index] / 2)
                 y = int(text["top"][index] + text["height"][index] / 2)
-                return x, y
-        return self._known_visible_order_rows().get(ticket)
+                centers[ticket] = (x, y)
+        return centers
+
+    def _calibrate_row_group(
+        self,
+        prefix: str,
+        rows: list[dict[str, Any]],
+        ticket_centers: dict[str, tuple[int, int]],
+    ) -> dict[str, tuple[int, int]]:
+        indexed_points: list[tuple[int, tuple[int, int]]] = []
+        for index, row in enumerate(rows):
+            ticket = str(row.get("ticket", "")).strip()
+            if ticket in ticket_centers:
+                indexed_points.append((index, ticket_centers[ticket]))
+        if not indexed_points:
+            return {}
+
+        coordinates = self.config.order_form_coordinates
+        anchor_key = f"{prefix}_row_anchor"
+        step_key = f"{prefix}_row_step_y"
+        max_key = f"{prefix}_row_max_y"
+        default_anchor = coordinates.get(
+            anchor_key,
+            coordinates.get("order_row_anchor", (253, 741)),
+        )
+        _, default_step_y = coordinates.get(step_key, coordinates.get("order_row_step_y", (0, 20)))
+        step_y = _derive_step_y(indexed_points, default_step_y)
+        first_index, first_point = min(indexed_points, key=lambda item: item[0])
+        anchor_y = first_point[1] - (first_index * step_y)
+        anchor_x = int(median([point[0] for _, point in indexed_points]) if indexed_points else default_anchor[0])
+        _, screen_height = self._screen_size_tuple()
+        visible_bottom = max(point[1] for _, point in indexed_points)
+        max_y = min(screen_height - 1, max(visible_bottom + step_y, anchor_y))
+        return {
+            anchor_key: (anchor_x, int(anchor_y)),
+            step_key: (0, int(step_y)),
+            max_key: (0, int(max_y)),
+        }
+
+    def _fallback_toolbox_coordinates(self) -> dict[str, tuple[int, int]]:
+        coordinates = self.config.order_form_coordinates
+        updates: dict[str, tuple[int, int]] = {}
+        for prefix in ("position", "order"):
+            anchor_key = f"{prefix}_row_anchor"
+            step_key = f"{prefix}_row_step_y"
+            max_key = f"{prefix}_row_max_y"
+            fallback_anchor = (
+                coordinates.get(anchor_key)
+                or coordinates.get("order_row_anchor")
+                or coordinates.get("position_row_fallback")
+                or (253, 741)
+            )
+            fallback_step = coordinates.get(step_key) or coordinates.get("order_row_step_y") or (0, 20)
+            step_y = max(1, int(fallback_step[1]))
+            scan_rows = int(coordinates.get(f"{prefix}_scan_rows", coordinates.get("order_scan_rows", (0, 12)))[1])
+            _, screen_height = self._screen_size_tuple()
+            configured_max = coordinates.get(max_key) or coordinates.get("order_row_max_y")
+            if configured_max is not None:
+                max_y = min(screen_height - 1, max(0, int(configured_max[1])))
+            else:
+                max_y = max(0, screen_height - 1 - 120)
+            anchor_y = max(0, max_y - (max(1, scan_rows) - 1) * step_y)
+            updates[anchor_key] = (int(fallback_anchor[0]), int(anchor_y))
+            updates[step_key] = (0, int(step_y))
+            updates[max_key] = (0, int(max_y))
+        return updates
+
+    def _screen_size_tuple(self) -> tuple[int, int]:
+        size = self.pyautogui.size()
+        if hasattr(size, "width") and hasattr(size, "height"):
+            return int(size.width), int(size.height)
+        return int(size[0]), int(size[1])
 
     def _click_visible_ticket_by_known_rows(self, destination_ticket: str) -> bool:
         visible_rows = self._known_visible_order_rows()
@@ -977,3 +1088,24 @@ def _format_number(value: Any) -> str:
         text = f"{value:.10f}".rstrip("0").rstrip(".")
         return text if text else "0"
     return str(value)
+
+
+def _derive_step_y(
+    indexed_points: list[tuple[int, tuple[int, int]]],
+    default_step_y: int,
+) -> int:
+    deltas: list[int] = []
+    ordered = sorted(indexed_points, key=lambda item: item[0])
+    for left, right in zip(ordered, ordered[1:]):
+        left_index, left_point = left
+        right_index, right_point = right
+        index_delta = right_index - left_index
+        if index_delta <= 0:
+            continue
+        y_delta = right_point[1] - left_point[1]
+        if y_delta <= 0:
+            continue
+        deltas.append(round(y_delta / index_delta))
+    if not deltas:
+        return int(default_step_y)
+    return max(1, int(median(deltas)))
