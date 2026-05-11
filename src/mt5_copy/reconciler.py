@@ -110,6 +110,9 @@ def reconcile_orders_to_source_authority(
         refreshed: list[dict[str, Any]] = []
         last_reason = "destination_ticket_not_found"
         for attempt in range(1, MAX_OPERATION_ATTEMPTS + 1):
+            if attempt > 1 and not _focus_mt5_before_retry(gui, logger, "create_order", attempt, source_ticket):
+                last_reason = "MT5 target was not focused before retry"
+                continue
             before_tickets = {
                 str(row.get("ticket", ""))
                 for row in _pending_order_rows(read_csv_rows(destination_orders_file))
@@ -165,11 +168,31 @@ def reconcile_orders_to_source_authority(
             created_ticket,
         )
 
-    for destination_ticket in extra_destinations:
+    pending_extra_destinations = list(extra_destinations)
+    while pending_extra_destinations:
+        refreshed = _pending_order_rows(read_csv_rows(destination_orders_file))
+        refreshed_source_rows = _pending_order_rows(read_csv_rows(source_orders_file))
+        refreshed_source_counts = _signature_counts(refreshed_source_rows)
+        refreshed_destination_counts = _signature_counts(refreshed)
+        pending_extra_destinations = [
+            ticket
+            for ticket in _surplus_destination_tickets(
+                refreshed,
+                refreshed_source_counts,
+                refreshed_destination_counts,
+                load_mapping(mapping_file),
+            )
+            if not is_operation_discarded(operation_error_file, destination_ticket=ticket)
+        ]
+        if not pending_extra_destinations:
+            break
+
+        destination_ticket = pending_extra_destinations[0]
         refreshed = _pending_order_rows(read_csv_rows(destination_orders_file))
         refreshed_destinations = {str(row.get("ticket", "")): row for row in refreshed}
         destination = refreshed_destinations.get(destination_ticket)
         if destination is None:
+            pending_extra_destinations = pending_extra_destinations[1:]
             continue
 
         if before_delete_check is not None:
@@ -199,7 +222,11 @@ def reconcile_orders_to_source_authority(
             continue
 
         last_reason = "still_present"
+        deleted_ticket = destination_ticket
         for attempt in range(1, MAX_OPERATION_ATTEMPTS + 1):
+            if attempt > 1 and not _focus_mt5_before_retry(gui, logger, "delete_order", attempt, destination_ticket):
+                last_reason = "MT5 target was not focused before retry"
+                continue
             row_center = _row_center_for_destination_ticket(destination_ticket, refreshed, gui)
             logger.info(
                 "AUTHORITY_SYNC deleting extra destination_ticket=%s attempt=%s/%s",
@@ -208,18 +235,23 @@ def reconcile_orders_to_source_authority(
                 MAX_OPERATION_ATTEMPTS,
             )
             try:
-                gui.delete_pending_order(destination_ticket, row_center=row_center)
+                delete_any_pending_order = getattr(gui, "delete_any_pending_order", None)
+                if callable(delete_any_pending_order):
+                    deleted_ticket, _screenshot = delete_any_pending_order(pending_extra_destinations)
+                else:
+                    gui.delete_pending_order(destination_ticket, row_center=row_center)
+                    deleted_ticket = destination_ticket
                 time.sleep(verify_delay_seconds)
             except Exception as exc:
                 last_reason = str(exc)
                 logger.exception("AUTHORITY_SYNC delete failed destination_ticket=%s attempt=%s", destination_ticket, attempt)
-            if destination_ticket not in {
+            if deleted_ticket not in {
                 str(row.get("ticket", ""))
                 for row in _pending_order_rows(read_csv_rows(destination_orders_file))
             }:
                 break
             refreshed = _pending_order_rows(read_csv_rows(destination_orders_file))
-            logger.error("AUTHORITY_SYNC delete did not remove destination_ticket=%s", destination_ticket)
+            logger.error("AUTHORITY_SYNC delete did not remove destination_ticket=%s", deleted_ticket)
         else:
             skipped.append(f"delete:{destination_ticket}:error")
             _mark_authority_error(
@@ -234,9 +266,10 @@ def reconcile_orders_to_source_authority(
             )
             continue
 
-        _mark_destination_canceled(mapping_file, destination_ticket)
+        _mark_destination_canceled(mapping_file, deleted_ticket)
         deleted += 1
-        logger.info("AUTHORITY_SYNC deleted destination_ticket=%s", destination_ticket)
+        logger.info("AUTHORITY_SYNC deleted destination_ticket=%s", deleted_ticket)
+        pending_extra_destinations = [ticket for ticket in pending_extra_destinations if ticket != deleted_ticket]
 
     return AuthoritySyncReport(
         exact_mapped=exact_mapped,
@@ -301,6 +334,9 @@ def reconcile_positions_to_source_authority(
         refreshed: list[dict[str, Any]] = []
         last_reason = "destination_ticket_not_found"
         for attempt in range(1, MAX_OPERATION_ATTEMPTS + 1):
+            if attempt > 1 and not _focus_mt5_before_retry(gui, logger, "create_position", attempt, source_ticket):
+                last_reason = "MT5 target was not focused before retry"
+                continue
             logger.info(
                 "AUTHORITY_SYNC creating missing market position source_ticket=%s attempt=%s/%s",
                 source_ticket,
@@ -409,6 +445,9 @@ def reconcile_positions_to_source_authority(
 
         last_reason = "still_present"
         for attempt in range(1, MAX_OPERATION_ATTEMPTS + 1):
+            if attempt > 1 and not _focus_mt5_before_retry(gui, logger, "close_position", attempt, destination_ticket):
+                last_reason = "MT5 target was not focused before retry"
+                continue
             logger.info(
                 "AUTHORITY_SYNC closing extra market position destination_ticket=%s attempt=%s/%s",
                 destination_ticket,
@@ -581,6 +620,10 @@ def reconcile_sl_tp(
         source = source_positions[issue.source_ticket] if is_position else source_orders[issue.source_ticket]
         last_reason = "sl_tp_mismatch_remains"
         for attempt in range(1, max_retries + 1):
+            operation = "update_position" if is_position else "update_order"
+            if attempt > 1 and not _focus_mt5_before_retry(gui, logger, operation, attempt, issue.destination_ticket):
+                last_reason = "MT5 target was not focused before retry"
+                continue
             logger.info(
                 "Reconciling SL/TP attempt=%s source=%s destination=%s diffs=%s",
                 attempt,
@@ -712,6 +755,36 @@ def _dismiss_gui_dialog(gui: Mt5GuiController, logger: logging.Logger) -> None:
         logger.exception("Failed to dismiss GUI dialog after reconciliation error.")
 
 
+def _focus_mt5_before_retry(
+    gui: Mt5GuiController,
+    logger: logging.Logger,
+    operation: str,
+    attempt: int,
+    ticket: Any,
+) -> bool:
+    focus_mt5 = getattr(gui, "focus_mt5", None)
+    if not callable(focus_mt5):
+        return True
+    try:
+        focused = bool(focus_mt5())
+    except Exception:
+        logger.exception(
+            "Failed to focus MT5 before retry operation=%s attempt=%s ticket=%s",
+            operation,
+            attempt,
+            ticket,
+        )
+        return False
+    logger.info(
+        "Focused MT5 before retry focused=%s operation=%s attempt=%s ticket=%s",
+        focused,
+        operation,
+        attempt,
+        ticket,
+    )
+    return focused
+
+
 def _mark_authority_error(
     operation_error_file: Path | None,
     on_operation_error: Callable[[OperationErrorRecord], None] | None,
@@ -840,15 +913,16 @@ def _surplus_destination_tickets(
         for row in mapping.values()
         if row.get("status") == "placed"
     }
-    extra: list[str] = []
+    keep: set[str] = set()
+    extra_signatures: set[tuple[str, ...]] = set()
 
     for signature, destination_count in destination_counts.items():
         source_count = source_counts.get(signature, 0)
         if destination_count <= source_count:
             continue
+        extra_signatures.add(signature)
 
         rows = [row for row in destination_rows if _order_signature(row) == signature]
-        keep: set[str] = set()
 
         for row in rows:
             ticket = str(row.get("ticket", ""))
@@ -864,9 +938,11 @@ def _surplus_destination_tickets(
                 break
             keep.add(ticket)
 
-        extra.extend(str(row.get("ticket", "")) for row in rows if str(row.get("ticket", "")) not in keep)
-
-    return extra
+    return [
+        str(row.get("ticket", ""))
+        for row in destination_rows
+        if _order_signature(row) in extra_signatures and str(row.get("ticket", "")) not in keep
+    ]
 
 
 def _find_new_matching_destination_ticket(

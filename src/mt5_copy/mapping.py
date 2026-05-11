@@ -35,9 +35,40 @@ def load_mapping(path: Path) -> dict[str, dict[str, Any]]:
 def upsert_mapping(path: Path, row: dict[str, Any]) -> None:
     mapping = load_mapping(path)
     source_ticket = str(row["source_ticket"])
-    mapping[source_ticket] = {field: row.get(field, "") for field in FIELDNAMES}
+    normalized = {field: row.get(field, "") for field in FIELDNAMES}
+    destination_ticket = str(normalized.get("destination_ticket", ""))
+    if normalized.get("status") == "placed" and destination_ticket:
+        for existing_source_ticket, existing in mapping.items():
+            if existing_source_ticket == source_ticket:
+                continue
+            if existing.get("status") != "placed":
+                continue
+            if str(existing.get("destination_ticket", "")) != destination_ticket:
+                continue
+            existing["status"] = "canceled"
+
+    mapping[source_ticket] = normalized
 
     with path.open("w", encoding="utf-8", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=FIELDNAMES)
         writer.writeheader()
         writer.writerows(mapping.values())
+
+
+def restore_error_mappings(path: Path) -> int:
+    mapping = load_mapping(path)
+    restored = 0
+    for row in mapping.values():
+        if row.get("status") != "error":
+            continue
+        row["status"] = "placed" if row.get("destination_ticket") else ""
+        restored += 1
+
+    if not restored:
+        return 0
+
+    with path.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(mapping.values())
+    return restored

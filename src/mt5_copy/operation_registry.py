@@ -82,6 +82,14 @@ def save_operation_errors(path: Path, records: dict[str, OperationErrorRecord]) 
     tmp_path.replace(path)
 
 
+def clear_operation_errors(path: Path) -> int:
+    records = load_operation_errors(path)
+    if not records:
+        return 0
+    save_operation_errors(path, {})
+    return len(records)
+
+
 def mark_operation_error(
     path: Path,
     *,

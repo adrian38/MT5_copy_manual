@@ -1,238 +1,262 @@
 {
-    "common_files_path":  "C:\\Users\\13199\\AppData\\Roaming\\MetaQuotes\\Terminal\\Common\\Files",
-    "poll_seconds":  1.0,
-    "log_level":  "INFO",
-    "terminals":  {
-                      "source_terminal_id":  "master_1",
-                      "destination_terminal_id":  "copy_1",
-                      "items":  [
-                                    {
-                                        "id":  "master_1",
-                                        "label":  "Master demo",
-                                        "role":  "source",
-                                        "file_prefix":  "slave",
-                                        "window_title_contains":  "",
-                                        "enabled":  true
-                                    },
-                                    {
-                                        "id":  "copy_1",
-                                        "label":  "Copia demo",
-                                        "role":  "destination",
-                                        "file_prefix":  "destination",
-                                        "window_title_contains":  "67192119",
-                                        "enabled":  true
-                                    }
-                                ]
-                  },
-    "files":  {
-                  "positions":  "slave_positions.csv",
-                  "orders":  "slave_orders.csv",
-                  "heartbeat":  "slave_heartbeat.csv",
-                  "destination_positions":  "destination_positions.csv",
-                  "destination_orders":  "destination_orders.csv",
-                  "destination_heartbeat":  "destination_heartbeat.csv",
-                  "state":  "data/state/last_snapshot.json",
-                  "mapping":  "data/mappings/ticket_mapping.csv",
-                  "events_log":  "logs/events.log",
-                  "app_log":  "logs/app.log"
-              },
-    "risk":  {
-                 "enabled":  false,
-                 "max_total_destination_volume":  0.0,
-                 "volume_multiplier":  1.0,
-                 "max_single_destination_volume":  0.1
-             },
-    "notifications":  {
-                          "telegram":  {
-                                           "enabled":  false,
-                                           "bot_token":  "8513055575:AAE1RYJ4F_WFoHLq47c2ltU0vorFE3nbOyI",
-                                           "chat_id":  "-1003519136130",
-                                           "prefix":  "MT5 COPY"
-                                       }
-                      },
-    "executor":  {
-                     "mode":  "pyautogui",
-                     "pyautogui_enabled":  true,
-                     "armed_for_trading":  true,
-                     "submit_orders":  true,
-                     "authority_sync_enabled":  true,
-                     "mt5_window_title_contains":  "67192119",
-                     "screenshot_dir":  "data/screenshots",
-                     "image_dir":  "data/images",
-                     "image_confidence":  0.85,
-                     "action_pause_seconds":  0.15,
-                     "fail_safe":  true,
-                     "new_order_hotkey":  [
-                                              "f9"
-                                          ],
-                     "new_order_button":  [
-                                              489,
-                                              59
-                                          ],
-                     "order_dialog_title_contains":  "Orden",
-                     "order_window_delay_seconds":  1.0,
-                     "field_delay_seconds":  0.25,
-                     "order_search_scroll_pages":  6,
-                     "order_search_scroll_clicks":  7,
-                     "order_search_arrow_down_presses":  8,
-                     "comment_prefix":  "COPY_",
-                     "order_form_coordinates":  {
-                                                    "symbol":  [
-                                                                   1160,
-                                                                   370
-                                                               ],
-                                                    "execution_type":  [
-                                                                           1160,
-                                                                           399
-                                                                       ],
-                                                    "pending_type":  [
-                                                                         1048,
-                                                                         445
-                                                                     ],
-                                                    "pending_type_option_base":  [
-                                                                                     1048,
-                                                                                     462
-                                                                                 ],
-                                                    "pending_type_option_step_y":  [
-                                                                                       0,
-                                                                                       14
-                                                                                   ],
-                                                    "volume":  [
-                                                                   1048,
-                                                                   473
-                                                               ],
-                                                    "price_open":  [
-                                                                       1048,
-                                                                       501
-                                                                   ],
-                                                    "sl":  [
-                                                               1048,
-                                                               529
-                                                           ],
-                                                    "tp":  [
-                                                               1268,
-                                                               529
-                                                           ],
-                                                    "modify":  [
-                                                                   1007,
-                                                                   626
-                                                               ],
-                                                    "modify_sl":  [
-                                                                      1048,
-                                                                      473
-                                                                  ],
-                                                    "modify_tp":  [
-                                                                      1268,
-                                                                      473
-                                                                  ],
-                                                    "delete":  [
-                                                                   1226,
-                                                                   626
-                                                               ],
-                                                    "order_row_anchor":  [
-                                                                             253,
-                                                                             741
-                                                                         ],
-                                                    "order_row_step_y":  [
-                                                                             0,
-                                                                             20
-                                                                         ],
-                                                    "order_scan_rows":  [
-                                                                            0,
-                                                                            12
-                                                                        ],
-                                                    "order_list_scroll_point":  [
-                                                                                    253,
-                                                                                    961
-                                                                                ],
-                                                    "order_row_max_y":  [
-                                                                            0,
-                                                                            961
-                                                                        ],
-                                                    "position_row_fallback":  [
-                                                                                  253,
-                                                                                  721
-                                                                              ],
-                                                    "position_row_anchor":  [
-                                                                                253,
-                                                                                721
-                                                                            ],
-                                                    "position_row_step_y":  [
-                                                                                0,
-                                                                                20
-                                                                            ],
-                                                    "position_row_max_y":  [
-                                                                               0,
-                                                                               941
-                                                                           ],
-                                                    "position_context_modify":  [
-                                                                                    375,
-                                                                                    354
-                                                                                ],
-                                                    "position_context_close":  [
-                                                                                   375,
-                                                                                   330
-                                                                               ],
-                                                    "position_modify_sl":  [
-                                                                               1048,
-                                                                               445
-                                                                           ],
-                                                    "position_modify_tp":  [
-                                                                               1048,
-                                                                               473
-                                                                           ],
-                                                    "position_modify":  [
-                                                                            1116,
-                                                                            575
-                                                                        ],
-                                                    "position_close_x":  [
-                                                                             1909,
-                                                                             721
-                                                                         ],
-                                                    "one_click_terms_checkbox":  [
-                                                                                     738,
-                                                                                     654
-                                                                                 ],
-                                                    "one_click_accept":  [
-                                                                             1068,
-                                                                             654
-                                                                         ],
-                                                    "market_volume":  [
-                                                                          1048,
-                                                                          445
-                                                                      ],
-                                                    "market_sl":  [
-                                                                      1048,
-                                                                      473
-                                                                  ],
-                                                    "market_tp":  [
-                                                                      1268,
-                                                                      473
-                                                                  ],
-                                                    "market_sell":  [
-                                                                        1007,
-                                                                        634
-                                                                    ],
-                                                    "market_buy":  [
-                                                                       1225,
-                                                                       634
-                                                                   ],
-                                                    "accept":  [
-                                                                   1008,
-                                                                   666
-                                                               ],
-                                                    "place":  [
-                                                                  1116,
-                                                                  668
-                                                              ],
-                                                    "buy_market":  [
-                                                                       1226,
-                                                                       668
-                                                                   ],
-                                                    "sell_market":  [
-                                                                        1008,
-                                                                        668
-                                                                    ]
-                                                }
-                 }
+  "common_files_path": "C:\\Users\\13199\\AppData\\Roaming\\MetaQuotes\\Terminal\\Common\\Files",
+  "poll_seconds": 1.0,
+  "log_level": "INFO",
+  "terminals": {
+    "source_terminal_id": "master_1",
+    "destination_terminal_id": "copy_1",
+    "items": [
+      {
+        "id": "master_1",
+        "label": "Master demo",
+        "role": "source",
+        "file_prefix": "slave",
+        "window_title_contains": "",
+        "enabled": true
+      },
+      {
+        "id": "copy_1",
+        "label": "Copia demo",
+        "role": "destination",
+        "file_prefix": "destination",
+        "window_title_contains": "67192119",
+        "enabled": true
+      }
+    ]
+  },
+  "files": {
+    "positions": "slave_positions.csv",
+    "orders": "slave_orders.csv",
+    "heartbeat": "slave_heartbeat.csv",
+    "destination_positions": "destination_positions.csv",
+    "destination_orders": "destination_orders.csv",
+    "destination_heartbeat": "destination_heartbeat.csv",
+    "state": "data/state/last_snapshot.json",
+    "mapping": "data/mappings/ticket_mapping.csv",
+    "events_log": "logs/events.log",
+    "app_log": "logs/app.log"
+  },
+  "risk": {
+    "enabled": false,
+    "max_total_destination_volume": 0.0,
+    "volume_multiplier": 1.0,
+    "max_single_destination_volume": 0.1
+  },
+  "notifications": {
+    "telegram": {
+      "enabled": false,
+      "bot_token": "8513055575:AAE1RYJ4F_WFoHLq47c2ltU0vorFE3nbOyI",
+      "chat_id": "-1003519136130",
+      "prefix": "MT5 COPY"
+    }
+  },
+  "executor": {
+    "mode": "pyautogui",
+    "pyautogui_enabled": true,
+    "armed_for_trading": true,
+    "submit_orders": true,
+    "authority_sync_enabled": true,
+    "mt5_window_title_contains": "67192119",
+    "screenshot_dir": "data/screenshots",
+    "image_dir": "data/images",
+    "image_confidence": 0.85,
+    "action_pause_seconds": 0.15,
+    "fail_safe": true,
+    "new_order_hotkey": [
+      "f9"
+    ],
+    "new_order_button": [
+      489,
+      59
+    ],
+    "order_dialog_title_contains": "Orden",
+    "order_window_delay_seconds": 1.0,
+    "field_delay_seconds": 0.25,
+    "order_search_scroll_pages": 6,
+    "order_search_scroll_clicks": 7,
+    "order_search_arrow_down_presses": 8,
+    "comment_prefix": "COPY_",
+    "order_form_coordinates": {
+      "symbol": [
+        648,
+        187
+      ],
+      "execution_type": [
+        1160,
+        399
+      ],
+      "pending_type": [
+        1048,
+        445
+      ],
+      "pending_type_option_base": [
+        1048,
+        462
+      ],
+      "pending_type_option_step_y": [
+        0,
+        14
+      ],
+      "volume": [
+        530,
+        229
+      ],
+      "price_open": [
+        530,
+        296
+      ],
+      "sl": [
+        530,
+        351
+      ],
+      "tp": [
+        530,
+        379
+      ],
+      "modify": [
+        512,
+        506
+      ],
+      "modify_sl": [
+        530,
+        257
+      ],
+      "modify_tp": [
+        530,
+        285
+      ],
+      "delete": [
+        722,
+        506
+      ],
+      "order_row_anchor": [
+        253,
+        439
+      ],
+      "order_row_step_y": [
+        0,
+        20
+      ],
+      "order_scan_rows": [
+        0,
+        13
+      ],
+      "order_list_scroll_point": [
+        253,
+        961
+      ],
+      "order_row_max_y": [
+        0,
+        672
+      ],
+      "position_row_fallback": [
+        253,
+        721
+      ],
+      "position_row_anchor": [
+        253,
+        439
+      ],
+      "position_row_step_y": [
+        0,
+        20
+      ],
+      "position_row_max_y": [
+        0,
+        672
+      ],
+      "position_context_modify": [
+        350,
+        353
+      ],
+      "position_context_close": [
+        335,
+        330
+      ],
+      "position_modify_sl": [
+        530,
+        229
+      ],
+      "position_modify_tp": [
+        530,
+        257
+      ],
+      "position_modify": [
+        617,
+        506
+      ],
+      "position_close_x": [
+        1909,
+        721
+      ],
+      "one_click_terms_checkbox": [
+        912,
+        540
+      ],
+      "one_click_accept": [
+        912,
+        540
+      ],
+      "market_volume": [
+        530,
+        229
+      ],
+      "market_sl": [
+        530,
+        257
+      ],
+      "market_tp": [
+        530,
+        285
+      ],
+      "market_sell": [
+        512,
+        523
+      ],
+      "market_buy": [
+        722,
+        523
+      ],
+      "accept": [
+        1008,
+        666
+      ],
+      "place": [
+        1116,
+        668
+      ],
+      "buy_market": [
+        722,
+        523
+      ],
+      "sell_market": [
+        512,
+        523
+      ],
+      "modern_order_market": [
+        286,
+        179
+      ],
+      "modern_order_limit": [
+        286,
+        217
+      ],
+      "modern_order_stop": [
+        286,
+        254
+      ],
+      "modern_order_stop_limit": [
+        286,
+        291
+      ],
+      "pending_sell": [
+        512,
+        554
+      ],
+      "pending_buy": [
+        722,
+        554
+      ]
+    }
+  }
 }

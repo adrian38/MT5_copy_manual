@@ -12,9 +12,11 @@ from tkinter import ttk
 from typing import Any
 
 from .app import calibrate_tracking_start, run_once
-from .config import AppConfig, DEFAULT_CONFIG_PATH, load_config
+from .config import PROJECT_ROOT, AppConfig, DEFAULT_CONFIG_PATH, load_config
 from .csv_reader import read_csv_rows, read_latest_row
 from .logging_setup import setup_logging
+from .mapping import restore_error_mappings
+from .operation_registry import clear_operation_errors, operation_error_path
 from .telegram_notifier import TelegramNotifier, telegram_config_from_settings
 
 
@@ -195,6 +197,11 @@ class CopyMonitorApp:
             command=lambda: self._safe_ui_call(self._toggle_telegram),
         )
         self.telegram_btn.grid(row=0, column=5, padx=(8, 0))
+        ttk.Button(
+            controls,
+            text="Rescatar descartadas",
+            command=lambda: self._safe_ui_call(self._rescue_discarded_operations),
+        ).grid(row=0, column=6, padx=(8, 0))
 
         routing = ttk.LabelFrame(self.root, text="Ruta de copia", padding=10)
         routing.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 10))
@@ -454,6 +461,19 @@ class CopyMonitorApp:
         self.telegram_btn.config(text=self._telegram_btn_text())
         estado = "activadas" if new_state else "desactivadas"
         self.logger.info("Notificaciones Telegram %s", estado)
+
+    def _rescue_discarded_operations(self) -> None:
+        operation_errors = operation_error_path(PROJECT_ROOT)
+        removed = clear_operation_errors(operation_errors)
+        restored = restore_error_mappings(self.config.mapping_file)
+        message = (
+            "Operaciones descartadas rescatadas: "
+            f"registro_limpiado={removed} mappings_reactivados={restored}"
+        )
+        self.scan_error = ""
+        self.error_var.set("")
+        self._append_log(message)
+        self.logger.warning(message)
 
     def _save_poll_seconds(self) -> None:
         try:

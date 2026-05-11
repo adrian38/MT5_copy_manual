@@ -96,6 +96,16 @@ class Mt5GuiController:
             if getattr(window, "isMinimized", False):
                 window.restore()
             window.activate()
+            if not self._active_window_matches(window):
+                self.logger.warning("Window activate did not make MT5 active, trying click fallback: %s", title)
+                x = int(getattr(window, "left", 0) + (getattr(window, "width", 0) / 2))
+                y = int(getattr(window, "top", 0) + 20)
+                self.pyautogui.click(x, y)
+                time.sleep(self.config.action_pause_seconds)
+            if not self._active_window_matches(window):
+                self.logger.warning("MT5 window focus could not be verified as active: %s", title)
+                return False
+            time.sleep(max(self.config.action_pause_seconds, 0.5))
             self.logger.info("Focused MT5 window: %s", title)
             return True
         except Exception:
@@ -104,6 +114,11 @@ class Mt5GuiController:
                 x = int(getattr(window, "left", 0) + (getattr(window, "width", 0) / 2))
                 y = int(getattr(window, "top", 0) + 20)
                 self.pyautogui.click(x, y)
+                time.sleep(self.config.action_pause_seconds)
+                if not self._active_window_matches(window):
+                    self.logger.warning("MT5 window focus fallback could not be verified as active: %s", title)
+                    return False
+                time.sleep(max(self.config.action_pause_seconds, 0.5))
                 self.logger.info("Focused MT5 window by click fallback: %s", title)
                 return True
             except Exception:
@@ -149,10 +164,16 @@ class Mt5GuiController:
         updates.update(self._calibrate_row_group("position", destination_positions, ticket_centers))
         updates.update(self._calibrate_row_group("order", destination_orders, ticket_centers))
         if not updates:
-            updates = self._fallback_toolbox_coordinates()
-            self.logger.warning(
-                "Toolbox calibration used fallback geometry because no destination tickets were available/readable."
-            )
+            updates = self._visual_toolbox_coordinates(destination_positions, destination_orders)
+            if updates:
+                self.logger.warning(
+                    "Toolbox calibration used visual toolbox geometry because no destination tickets were available/readable."
+                )
+            else:
+                self.logger.warning(
+                    "Toolbox calibration kept existing coordinates because no destination tickets or visual toolbox rows were readable."
+                )
+                return {}
 
         self.config.order_form_coordinates.update(updates)
         self.logger.info("Toolbox coordinates calibrated: %s", updates)
@@ -260,6 +281,12 @@ class Mt5GuiController:
     def switch_to_market_execution_mode(self) -> None:
         self._require_armed("switch to market execution mode")
         coordinates = self.config.order_form_coordinates
+        if "modern_order_market" in coordinates:
+            self.pyautogui.click(*coordinates["modern_order_market"])
+            time.sleep(self.config.order_window_delay_seconds)
+            self.logger.info("Switched order window to market execution mode.")
+            return
+
         if "execution_type" not in coordinates:
             raise GuiSafetyError("Missing coordinates for order field: execution_type")
         x, y = coordinates["execution_type"]
@@ -317,7 +344,7 @@ class Mt5GuiController:
         screenshot_before = self.screenshot("before_order_created")
         order_window = self.open_new_order_window()
         symbol_screenshot = self.select_symbol(str(order.get("symbol", "")))
-        pending_mode_screenshot = self.switch_to_pending_order_mode()
+        pending_mode_screenshot = self.switch_to_pending_order_mode(str(order.get("type", "")))
         fields_screenshot = self.fill_basic_order_fields(order)
         prepared = {
             "source_ticket": order.get("ticket", ""),
@@ -343,7 +370,7 @@ class Mt5GuiController:
             )
             return prepared
 
-        submit_screenshot = self.submit_pending_order()
+        submit_screenshot = self.submit_pending_order(str(order.get("type", "")))
         prepared["screenshot_submitted"] = str(submit_screenshot)
         return prepared
 
@@ -381,13 +408,19 @@ class Mt5GuiController:
         prepared["screenshot_submitted"] = str(submit_screenshot)
         return prepared
 
-    def submit_pending_order(self) -> Path:
+    def submit_pending_order(self, order_type: str = "") -> Path:
         self._require_armed("submit pending order")
         coordinates = self.config.order_form_coordinates
-        if "place" not in coordinates:
-            raise GuiSafetyError("Missing coordinates for order field: place")
+        order_type_upper = order_type.strip().upper()
+        if "pending_buy" in coordinates and "pending_sell" in coordinates:
+            button_key = "pending_buy" if order_type_upper.startswith("BUY") else "pending_sell"
+        else:
+            button_key = "place"
 
-        x, y = coordinates["place"]
+        if button_key not in coordinates:
+            raise GuiSafetyError(f"Missing coordinates for order field: {button_key}")
+
+        x, y = coordinates[button_key]
         self.pyautogui.click(x, y)
         time.sleep(self.config.order_window_delay_seconds)
         screenshot_path = self.screenshot("after_place_clicked")
@@ -440,11 +473,67 @@ class Mt5GuiController:
     ) -> Path:
         self._require_armed("delete pending order")
         self.open_existing_order_dialog(destination_ticket, row_center=row_center)
+        return self._delete_open_pending_order(destination_ticket)
+
+    def delete_any_pending_order(self, destination_tickets: list[str] | set[str] | tuple[str, ...]) -> tuple[str, Path]:
+        self._require_armed("delete any pending order")
+        acceptable = {str(ticket) for ticket in destination_tickets if str(ticket)}
+        if not acceptable:
+            raise GuiSafetyError("No destination tickets supplied for bulk pending delete.")
+
+        self._ensure_no_trade_dialog_open("before bulk pending delete")
+        self._reset_order_list_to_top()
+        candidates = [candidate for candidate in self._order_row_candidates(None) if candidate is not None]
+        candidates = sorted(candidates, key=lambda point: point[1], reverse=True)
+
+        for page in range(self.config.order_search_scroll_pages + 1):
+            for candidate in candidates:
+                self._ensure_no_trade_dialog_open("before clicking bulk delete row")
+                self.focus_mt5()
+                if self._trade_dialog_is_open():
+                    raise GuiSafetyError("Refusing bulk delete row click while an MT5 trade dialog is still open.")
+                if not self._click_order_row_by_ticket("", row_center=candidate):
+                    continue
+
+                time.sleep(self.config.order_window_delay_seconds)
+                if not self._order_dialog_is_open():
+                    continue
+
+                opened_ticket = self._trade_dialog_ticket_in(acceptable)
+                if opened_ticket:
+                    screenshot_path = self._delete_open_pending_order(opened_ticket)
+                    return opened_ticket, screenshot_path
+
+                self.logger.warning(
+                    "Opened non-extra order dialog during bulk delete page=%s candidate=%s",
+                    page,
+                    candidate,
+                )
+                self._ensure_no_trade_dialog_open("after non-extra order dialog opened")
+
+            if page < self.config.order_search_scroll_pages:
+                self._ensure_no_trade_dialog_open("before scrolling bulk delete list")
+                self._scroll_order_list_down(page + 1)
+
+        screenshot_path = self.screenshot("bulk_delete_order_not_found")
+        self._ensure_no_trade_dialog_open("after bulk delete failed")
+        raise GuiSafetyError(
+            f"Could not open any acceptable pending order for bulk delete tickets={sorted(acceptable)}. "
+            f"Screenshot: {screenshot_path}"
+        )
+
+    def _delete_open_pending_order(self, destination_ticket: str) -> Path:
         coordinates = self.config.order_form_coordinates
 
         if "delete" not in coordinates:
             raise GuiSafetyError("Missing coordinates for order field: delete")
 
+        if not self._order_dialog_is_open():
+            screenshot_path = self.screenshot("pending_delete_dialog_not_open")
+            raise GuiSafetyError(
+                f"Refusing to click pending delete because the order dialog is not open "
+                f"for destination_ticket={destination_ticket}. Screenshot: {screenshot_path}"
+            )
         x, y = coordinates["delete"]
         self.pyautogui.click(x, y)
         time.sleep(self.config.order_window_delay_seconds)
@@ -454,7 +543,7 @@ class Mt5GuiController:
             destination_ticket,
             screenshot_path,
         )
-        self.accept_active_dialog()
+        self._ensure_no_trade_dialog_open("after pending delete click")
         return screenshot_path
 
     def modify_position_sl_tp(
@@ -518,34 +607,49 @@ class Mt5GuiController:
         trade_type: str | None = None,
     ) -> Path:
         self._require_armed("close position from context menu")
-        self.close_active_dialog()
+        self._ensure_no_trade_dialog_open("before position context close")
+        self._reset_order_list_to_top()
         self.focus_mt5()
-        if row_center is not None:
-            self.pyautogui.rightClick(*self._clamp_point_to_screen(row_center))
-        elif not self._right_click_ticket_row(destination_ticket):
-            screenshot_path = self.screenshot("position_context_close_ticket_not_found")
-            raise GuiSafetyError(
-                f"Destination position ticket {destination_ticket} was not visible for context close. "
-                f"Screenshot: {screenshot_path}"
-            )
+        if self._trade_dialog_is_open():
+            raise GuiSafetyError("Refusing to click a position row while an MT5 trade dialog is still open.")
+        def click_context_close() -> None:
+            if row_center is not None:
+                self.pyautogui.rightClick(*self._clamp_point_to_screen(row_center))
+            elif not self._right_click_ticket_row(destination_ticket):
+                screenshot_path = self.screenshot("position_context_close_ticket_not_found")
+                raise GuiSafetyError(
+                    f"Destination position ticket {destination_ticket} was not visible for context close. "
+                    f"Screenshot: {screenshot_path}"
+                )
 
-        time.sleep(self.config.field_delay_seconds)
-        coordinates = self.config.order_form_coordinates
-        if "position_context_close" in coordinates:
-            self.pyautogui.click(*coordinates["position_context_close"])
-        else:
-            self.pyautogui.press("down", presses=1)
-            self.pyautogui.press("enter")
-        time.sleep(self.config.order_window_delay_seconds)
+            time.sleep(self.config.field_delay_seconds)
+            coordinates = self.config.order_form_coordinates
+            if "position_context_close" in coordinates:
+                self.pyautogui.click(*coordinates["position_context_close"])
+            else:
+                self.pyautogui.press("down", presses=1)
+                self.pyautogui.press("enter")
+            time.sleep(self.config.order_window_delay_seconds)
+
+        click_context_close()
+        if self._accept_one_click_terms_if_open():
+            click_context_close()
+
         if self._trade_dialog_is_open():
             self._submit_position_close_dialog(trade_type)
+            self._ensure_no_trade_dialog_open("after position context close")
+        else:
+            self.logger.warning(
+                "Position close command did not open a dialog; relying on live CSV verification destination_ticket=%s row_center=%s",
+                destination_ticket,
+                row_center,
+            )
         screenshot_path = self.screenshot("after_position_context_close_clicked")
         self.logger.info(
-            "Closed position from context menu destination_ticket=%s screenshot=%s",
+            "Clicked position close command destination_ticket=%s screenshot=%s",
             destination_ticket,
             screenshot_path,
         )
-        self.accept_active_dialog()
         return screenshot_path
 
     def _submit_position_close_dialog(self, trade_type: str | None) -> None:
@@ -574,10 +678,11 @@ class Mt5GuiController:
             return False
 
         coordinates = self.config.order_form_coordinates
-        checkbox = coordinates.get("one_click_terms_checkbox", (738, 654))
-        accept = coordinates.get("one_click_accept", (1068, 654))
-        self.pyautogui.click(*self._clamp_point_to_screen(checkbox))
-        time.sleep(self.config.field_delay_seconds)
+        checkbox = coordinates.get("one_click_terms_checkbox")
+        accept = coordinates.get("one_click_accept", (912, 540))
+        if checkbox is not None and checkbox != accept:
+            self.pyautogui.click(*self._clamp_point_to_screen(checkbox))
+            time.sleep(self.config.field_delay_seconds)
         self.pyautogui.click(*self._clamp_point_to_screen(accept))
         time.sleep(self.config.order_window_delay_seconds)
         self.logger.info("Accepted MT5 one-click trading terms for position close.")
@@ -589,14 +694,18 @@ class Mt5GuiController:
         row_center: tuple[int, int] | None = None,
     ) -> Path:
         self._require_armed("open existing order dialog")
+        self._ensure_no_trade_dialog_open("before opening existing order")
+        self._reset_order_list_to_top()
         candidates = self._order_row_candidates(row_center)
         if not candidates:
             candidates = [None]
 
         for page in range(self.config.order_search_scroll_pages + 1):
             for candidate in candidates:
-                self._dismiss_active_dialog()
+                self._ensure_no_trade_dialog_open("before clicking order row")
                 self.focus_mt5()
+                if self._trade_dialog_is_open():
+                    raise GuiSafetyError("Refusing to click order row while an MT5 trade dialog is still open.")
                 if not self._click_order_row_by_ticket(destination_ticket, row_center=candidate):
                     continue
 
@@ -615,13 +724,14 @@ class Mt5GuiController:
                     page,
                     candidate,
                 )
+                self._ensure_no_trade_dialog_open("after wrong order dialog opened")
 
             if page < self.config.order_search_scroll_pages:
-                self._dismiss_active_dialog()
+                self._ensure_no_trade_dialog_open("before scrolling order list")
                 self._scroll_order_list_down(page + 1)
 
         screenshot_path = self.screenshot("modify_order_ticket_not_found")
-        self._dismiss_active_dialog()
+        self._ensure_no_trade_dialog_open("after order search failed")
         raise GuiSafetyError(
             f"Could not open modify dialog for expected ticket {destination_ticket}. "
             f"Screenshot: {screenshot_path}"
@@ -675,8 +785,78 @@ class Mt5GuiController:
         time.sleep(self.config.field_delay_seconds)
 
     def _dismiss_active_dialog(self) -> None:
-        self.pyautogui.press("esc")
-        time.sleep(self.config.field_delay_seconds)
+        self._ensure_no_trade_dialog_open("dismiss active dialog")
+
+    def _ensure_no_trade_dialog_open(self, context: str) -> None:
+        for attempt in range(1, 5):
+            if self._accept_one_click_terms_if_open():
+                continue
+            if not self._trade_dialog_is_open():
+                return
+
+            closed_one = False
+            for window in self._trade_dialog_windows():
+                try:
+                    if getattr(window, "isMinimized", False):
+                        window.restore()
+                    window.activate()
+                    time.sleep(self.config.field_delay_seconds)
+                except Exception:
+                    self.logger.exception("Could not activate MT5 dialog during cleanup context=%s", context)
+                self.pyautogui.press("esc")
+                time.sleep(self.config.field_delay_seconds)
+                closed_one = True
+                if not self._trade_dialog_is_open():
+                    return
+                try:
+                    window.activate()
+                    time.sleep(self.config.field_delay_seconds)
+                except Exception:
+                    pass
+                self.pyautogui.hotkey("alt", "f4")
+                time.sleep(self.config.field_delay_seconds)
+                if not self._trade_dialog_is_open():
+                    return
+
+            if not closed_one:
+                self.pyautogui.press("esc")
+                time.sleep(self.config.field_delay_seconds)
+
+            self.logger.warning(
+                "MT5 trade dialog still open during cleanup context=%s attempt=%s",
+                context,
+                attempt,
+            )
+
+        screenshot_path = self.screenshot("trade_dialog_still_open")
+        raise GuiSafetyError(
+            f"MT5 trade dialog remained open before table action context={context}. Screenshot: {screenshot_path}"
+        )
+
+    def _trade_dialog_windows(self):
+        windows = []
+        seen: set[int] = set()
+        for title_contains in (
+            self.config.order_dialog_title_contains,
+            "Posición",
+            "PosiciÃ³n",
+            "Trading con un clic",
+        ):
+            try:
+                matches = self.pyautogui.getWindowsWithTitle(title_contains)
+            except Exception:
+                self.logger.exception("Dialog lookup failed for title: %s", title_contains)
+                continue
+            for window in matches:
+                identity = id(window)
+                if identity in seen:
+                    continue
+                title = str(getattr(window, "title", ""))
+                if title_contains.lower() not in title.lower():
+                    continue
+                seen.add(identity)
+                windows.append(window)
+        return windows
 
     def _click_order_row_by_ticket(
         self,
@@ -688,6 +868,16 @@ class Mt5GuiController:
             return False
         self.pyautogui.doubleClick(*center)
         return True
+
+    def _trade_dialog_ticket_in(self, tickets: set[str]) -> str | None:
+        if not tickets:
+            return None
+        for window in self._trade_dialog_windows():
+            title = str(getattr(window, "title", ""))
+            for ticket in tickets:
+                if ticket in title:
+                    return ticket
+        return None
 
     def _order_row_candidates(
         self,
@@ -740,6 +930,25 @@ class Mt5GuiController:
             point,
             self.config.order_search_arrow_down_presses,
         )
+
+    def _reset_order_list_to_top(self) -> None:
+        self._ensure_no_trade_dialog_open("before resetting order list")
+        self.focus_mt5()
+        point = self._first_visible_order_row_point() or self._last_visible_order_row_point()
+        if point is None:
+            return
+        point = self._clamp_point_to_screen(point)
+        self.pyautogui.click(*point)
+        time.sleep(self.config.field_delay_seconds)
+        self.pyautogui.press("home", presses=3)
+        time.sleep(self.config.order_window_delay_seconds)
+        self.logger.info("Reset destination order list to top before row lookup focus_point=%s", point)
+
+    def _first_visible_order_row_point(self) -> tuple[int, int] | None:
+        candidates = [candidate for candidate in self._order_row_candidates(None) if candidate is not None]
+        if not candidates:
+            return None
+        return min(candidates, key=lambda point: point[1])
 
     def _last_visible_order_row_point(self) -> tuple[int, int] | None:
         candidates = [candidate for candidate in self._order_row_candidates(None) if candidate is not None]
@@ -858,6 +1067,89 @@ class Mt5GuiController:
             updates[max_key] = (0, int(max_y))
         return updates
 
+    def _visual_toolbox_coordinates(
+        self,
+        destination_positions: list[dict[str, Any]],
+        destination_orders: list[dict[str, Any]],
+    ) -> dict[str, tuple[int, int]]:
+        screenshot = self.pyautogui.screenshot()
+        width, height = screenshot.size
+        candidate_edges = self._horizontal_toolbox_edges(screenshot.convert("RGB"), width, height)
+        if len(candidate_edges) < 3:
+            return {}
+
+        step_y = _derive_visual_step_y(candidate_edges)
+        if step_y is None:
+            configured_step = (
+                self.config.order_form_coordinates.get("order_row_step_y")
+                or self.config.order_form_coordinates.get("position_row_step_y")
+                or (0, 20)
+            )
+            step_y = max(1, int(configured_step[1]))
+
+        bottom_edge = candidate_edges[-1]
+        # MT5 "Operaciones" renders positions above the balance line and pending orders below it.
+        position_anchor_y = int(round(candidate_edges[1] + (step_y / 2)))
+        order_anchor_y = int(round(candidate_edges[2] + (step_y / 2)))
+        max_y = int(round(bottom_edge - (step_y / 4)))
+        if min(position_anchor_y, order_anchor_y) >= max_y:
+            return {}
+
+        coordinates = self.config.order_form_coordinates
+        fallback_x = (
+            coordinates.get("order_row_anchor")
+            or coordinates.get("position_row_anchor")
+            or coordinates.get("position_row_fallback")
+            or (253, 0)
+        )[0]
+        anchor_x = min(max(0, int(fallback_x)), width - 1)
+
+        updates: dict[str, tuple[int, int]] = {}
+        updates["position_row_anchor"] = (
+            anchor_x,
+            position_anchor_y if destination_positions else order_anchor_y,
+        )
+        updates["position_row_step_y"] = (0, int(step_y))
+        updates["position_row_max_y"] = (0, max_y)
+        updates["order_row_anchor"] = (
+            anchor_x,
+            order_anchor_y if destination_orders or not destination_positions else position_anchor_y,
+        )
+        updates["order_row_step_y"] = (0, int(step_y))
+        updates["order_row_max_y"] = (0, max_y)
+        return updates
+
+    def _horizontal_toolbox_edges(self, image, width: int, height: int) -> list[int]:
+        start_y = max(0, int(height * 0.48))
+        end_y = max(start_y, height - 85)
+        raw_edges: list[int] = []
+        for y in range(start_y + 1, end_y):
+            neutral_pixels = 0
+            for x in range(0, width, 2):
+                red, green, blue = image.getpixel((x, y))
+                if abs(red - green) <= 2 and abs(green - blue) <= 2 and 45 <= red <= 75:
+                    neutral_pixels += 1
+            if neutral_pixels >= int((width / 2) * 0.70):
+                raw_edges.append(y)
+        if not raw_edges:
+            return []
+
+        clusters: list[list[int]] = []
+        for y in raw_edges:
+            if not clusters or y - clusters[-1][-1] > 3:
+                clusters.append([y])
+            else:
+                clusters[-1].append(y)
+
+        edges: list[int] = []
+        for cluster in clusters:
+            if cluster[-1] - cluster[0] >= 8:
+                edges.extend([cluster[0], cluster[-1]])
+            else:
+                edges.append(int(round(median(cluster))))
+        regular_edges = _longest_regular_edge_run(edges)
+        return regular_edges if len(regular_edges) >= 5 else edges
+
     def _screen_size_tuple(self) -> tuple[int, int]:
         size = self.pyautogui.size()
         if hasattr(size, "width") and hasattr(size, "height"):
@@ -889,13 +1181,8 @@ class Mt5GuiController:
 
     def close_active_dialog(self) -> None:
         self._require_armed("close active dialog")
-        self.focus_mt5()
-        if "accept" in self.config.order_form_coordinates:
-            self.pyautogui.click(*self.config.order_form_coordinates["accept"])
-            time.sleep(self.config.field_delay_seconds)
-        self.pyautogui.press("esc")
-        time.sleep(self.config.field_delay_seconds)
-        self.logger.info("Pressed Escape to clear any active MT5 dialog.")
+        self._ensure_no_trade_dialog_open("close active dialog")
+        self.logger.info("Cleared any active MT5 trade dialog.")
 
     def select_symbol(self, symbol: str) -> Path:
         self._require_armed("select symbol")
@@ -906,9 +1193,17 @@ class Mt5GuiController:
         self.logger.info("Selected symbol: %s", symbol)
         return screenshot_path
 
-    def switch_to_pending_order_mode(self) -> Path:
+    def switch_to_pending_order_mode(self, order_type: str = "") -> Path:
         self._require_armed("switch to pending order mode")
         coordinates = self.config.order_form_coordinates
+        modern_key = _modern_pending_tab_key(order_type)
+        if modern_key and modern_key in coordinates:
+            self.pyautogui.click(*coordinates[modern_key])
+            time.sleep(self.config.order_window_delay_seconds)
+            screenshot_path = self.screenshot("pending_order_mode")
+            self.logger.info("Switched order window to pending mode: %s", screenshot_path)
+            return screenshot_path
+
         if "execution_type" not in coordinates:
             raise GuiSafetyError("Missing coordinates for order field: execution_type")
 
@@ -1034,15 +1329,29 @@ class Mt5GuiController:
             self.logger.exception("Window lookup failed.")
             return []
 
+    def _active_window_matches(self, window) -> bool:
+        try:
+            active = self.pyautogui.getActiveWindow()
+        except Exception:
+            self.logger.exception("Could not verify active window.")
+            return False
+        active_title = str(getattr(active, "title", ""))
+        expected_title = str(getattr(window, "title", ""))
+        return bool(active_title and expected_title and active_title == expected_title)
+
     def _order_dialog_is_open(self) -> bool:
         return self._dialog_title_is_open(self.config.order_dialog_title_contains)
 
     def _trade_dialog_is_open(self) -> bool:
-        return self._order_dialog_is_open() or self._dialog_title_is_open("Posición")
+        return (
+            self._order_dialog_is_open()
+            or self._dialog_title_is_open("Posición")
+            or self._dialog_title_is_open("Trading con un clic")
+        )
 
     def _trade_dialog_title_contains(self, text: str) -> bool:
         expected = str(text)
-        for title_contains in (self.config.order_dialog_title_contains, "Posición"):
+        for title_contains in (self.config.order_dialog_title_contains, "Posición", "Trading con un clic"):
             try:
                 windows = self.pyautogui.getWindowsWithTitle(title_contains)
             except Exception:
@@ -1090,6 +1399,17 @@ def _format_number(value: Any) -> str:
     return str(value)
 
 
+def _modern_pending_tab_key(order_type: str) -> str:
+    order_type_upper = order_type.strip().upper()
+    if order_type_upper in {"BUY_LIMIT", "SELL_LIMIT"}:
+        return "modern_order_limit"
+    if order_type_upper in {"BUY_STOP", "SELL_STOP"}:
+        return "modern_order_stop"
+    if order_type_upper in {"BUY_STOP_LIMIT", "SELL_STOP_LIMIT"}:
+        return "modern_order_stop_limit"
+    return ""
+
+
 def _derive_step_y(
     indexed_points: list[tuple[int, tuple[int, int]]],
     default_step_y: int,
@@ -1109,3 +1429,34 @@ def _derive_step_y(
     if not deltas:
         return int(default_step_y)
     return max(1, int(median(deltas)))
+
+
+def _derive_visual_step_y(edges: list[int]) -> int | None:
+    deltas = [
+        right - left
+        for left, right in zip(edges, edges[1:])
+        if 12 <= right - left <= 35
+    ]
+    if len(deltas) < 3:
+        return None
+    return max(1, int(round(median(deltas))))
+
+
+def _longest_regular_edge_run(edges: list[int]) -> list[int]:
+    if len(edges) < 5:
+        return edges
+
+    best: list[int] = []
+    for start_index, start in enumerate(edges):
+        run = [start]
+        last = start
+        for edge in edges[start_index + 1 :]:
+            delta = edge - last
+            if 12 <= delta <= 35:
+                run.append(edge)
+                last = edge
+            elif delta > 35 and len(run) >= 5:
+                break
+        if len(run) > len(best):
+            best = run
+    return best

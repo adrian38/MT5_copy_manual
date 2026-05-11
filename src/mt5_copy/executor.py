@@ -104,6 +104,8 @@ class PyAutoGuiExecutor:
         last_error = ""
         for attempt in range(1, MAX_OPERATION_ATTEMPTS + 1):
             try:
+                if attempt > 1:
+                    self._focus_mt5_before_retry(operation, event, attempt)
                 action(event)
                 return
             except OperationAttemptError as exc:
@@ -127,6 +129,23 @@ class PyAutoGuiExecutor:
                 )
 
         self._mark_event_error(operation, event, last_error or "unknown failure")
+
+    def _focus_mt5_before_retry(self, operation: str, event: ChangeEvent, attempt: int) -> None:
+        focus_mt5 = getattr(self.gui, "focus_mt5", None)
+        if not callable(focus_mt5):
+            return
+        focused = bool(focus_mt5())
+        self.logger.info(
+            "Focused MT5 before retry focused=%s operation=%s attempt=%s source_ticket=%s",
+            focused,
+            operation,
+            attempt,
+            event.source_ticket,
+        )
+        if not focused:
+            raise OperationAttemptError(
+                f"MT5 target was not focused before retry operation={operation} source_ticket={event.source_ticket}"
+            )
 
     def _mark_event_error(self, operation: str, event: ChangeEvent, reason: str) -> None:
         if self.operation_error_file is None:
@@ -430,7 +449,11 @@ class PyAutoGuiExecutor:
         mapping = load_mapping(self.mapping_file)
         map_row = mapping.get(str(event.source_ticket))
         if not map_row:
-            raise OperationAttemptError(f"ORDER_DELETED has no destination mapping source_ticket={event.source_ticket}")
+            self.logger.warning(
+                "ORDER_DELETED ignored because source has no destination mapping source_ticket=%s",
+                event.source_ticket,
+            )
+            return
 
         if map_row.get("status") != "placed":
             self.logger.info(
@@ -442,19 +465,28 @@ class PyAutoGuiExecutor:
             return
 
         destination_ticket = str(map_row.get("destination_ticket", ""))
-        row_center = self._visible_order_row_center(destination_ticket)
-        if row_center is None:
-            raise OperationAttemptError(
-                "ORDER_DELETED skipped because destination ticket is not visible/current "
-                f"source_ticket={event.source_ticket} destination_ticket={destination_ticket}"
+        if not destination_ticket:
+            updated = dict(map_row)
+            updated["status"] = "canceled"
+            upsert_mapping(self.mapping_file, updated)
+            self.logger.info(
+                "ORDER_DELETED mapping marked canceled because it has no destination ticket source_ticket=%s",
+                event.source_ticket,
             )
+            return
 
+        source_row = event.previous or {}
         destination_row = self._destination_order_row(destination_ticket)
         if destination_row is None:
-            raise OperationAttemptError(
-                f"ORDER_DELETED skipped because destination row is missing source_ticket={event.source_ticket} "
-                f"destination_ticket={destination_ticket}"
+            updated = dict(map_row)
+            updated["status"] = "canceled"
+            upsert_mapping(self.mapping_file, updated)
+            self.logger.info(
+                "ORDER_DELETED mapping marked canceled because destination ticket is already absent source_ticket=%s destination_ticket=%s",
+                event.source_ticket,
+                destination_ticket,
             )
+            return
 
         active_source = self._find_active_source_order_matching_destination(
             destination_row,
@@ -485,22 +517,56 @@ class PyAutoGuiExecutor:
             )
             return
 
-        source_row = event.previous or {}
-        mismatches = _order_field_mismatches(source_row, destination_row)
-        if mismatches:
+        candidate_rows = [destination_row]
+        if source_row:
+            exact_candidates = self._destination_orders_matching_source(source_row)
+            if exact_candidates:
+                candidate_rows = exact_candidates
+
+        candidate_rows = [
+            row
+            for row in candidate_rows
+            if self._find_active_source_order_matching_destination(
+                row,
+                exclude_source_ticket=str(event.source_ticket),
+            )
+            is None
+        ]
+        candidate_tickets = [
+            str(row.get("ticket", ""))
+            for row in candidate_rows
+            if str(row.get("ticket", ""))
+        ]
+        surplus_tickets = self._surplus_destination_order_tickets()
+        if surplus_tickets:
+            candidate_tickets = list(dict.fromkeys([*candidate_tickets, *surplus_tickets]))
+
+        if not candidate_tickets:
+            mismatches = _order_field_mismatches(source_row, destination_row)
             raise OperationAttemptError(
-                "ORDER_DELETED skipped because mapped destination does not match deleted source "
+                "ORDER_DELETED skipped because no safe destination candidate matched deleted source "
                 f"source_ticket={event.source_ticket} destination_ticket={destination_ticket} mismatches={mismatches}"
             )
 
-        screenshot = self.gui.delete_pending_order(destination_ticket, row_center=row_center)
+        delete_any_pending_order = getattr(self.gui, "delete_any_pending_order", None)
+        if callable(delete_any_pending_order):
+            deleted_ticket, screenshot = delete_any_pending_order(candidate_tickets)
+        else:
+            row_center = self._visible_order_row_center(candidate_tickets[0])
+            if row_center is None:
+                raise OperationAttemptError(
+                    "ORDER_DELETED skipped because destination ticket is not visible/current "
+                    f"source_ticket={event.source_ticket} destination_ticket={candidate_tickets[0]}"
+                )
+            deleted_ticket = candidate_tickets[0]
+            screenshot = self.gui.delete_pending_order(deleted_ticket, row_center=row_center)
         updated = dict(map_row)
         updated["status"] = "canceled"
         upsert_mapping(self.mapping_file, updated)
         self.logger.info(
             "ORDER_DELETED executed source_ticket=%s destination_ticket=%s screenshot=%s",
             event.source_ticket,
-            destination_ticket,
+            deleted_ticket,
             screenshot,
         )
 
@@ -516,6 +582,36 @@ class PyAutoGuiExecutor:
         if self.destination_orders_file is None:
             return []
         return read_csv_rows(self.destination_orders_file)
+
+    def _destination_orders_matching_source(self, source_order: dict[str, Any]) -> list[dict[str, Any]]:
+        return [
+            row
+            for row in self._destination_order_rows()
+            if not _order_field_mismatches(source_order, row)
+        ]
+
+    def _surplus_destination_order_tickets(self) -> list[str]:
+        if self.source_orders_file is None or self.destination_orders_file is None:
+            return []
+        remaining_source_signatures: dict[tuple[str, ...], int] = {}
+        for row in read_csv_rows(self.source_orders_file):
+            if _is_market_trade_type(row.get("type")):
+                continue
+            signature = _order_signature(row)
+            remaining_source_signatures[signature] = remaining_source_signatures.get(signature, 0) + 1
+
+        surplus: list[str] = []
+        for row in read_csv_rows(self.destination_orders_file):
+            if _is_market_trade_type(row.get("type")):
+                continue
+            signature = _order_signature(row)
+            if remaining_source_signatures.get(signature, 0) > 0:
+                remaining_source_signatures[signature] -= 1
+                continue
+            ticket = str(row.get("ticket", ""))
+            if ticket:
+                surplus.append(ticket)
+        return surplus
 
     def _destination_order_tickets(self) -> set[str]:
         if self.destination_orders_file is None:
@@ -601,6 +697,9 @@ class PyAutoGuiExecutor:
         anchor_x, top_y = coordinates.get("order_row_anchor", (253, 741))
         _, step_y = coordinates.get("order_row_step_y", (0, 20))
         y = top_y + (index * step_y)
+        max_y = coordinates.get("order_row_max_y", (0, 941))[1]
+        if y > max_y:
+            return None
         return anchor_x, y
 
     def _destination_position_tickets(self) -> set[str]:
@@ -773,6 +872,18 @@ def _order_field_mismatches(
         }
 
     return mismatches
+
+
+def _order_signature(row: dict[str, Any]) -> tuple[str, ...]:
+    volume = row.get("volume_current", row.get("volume_initial", ""))
+    return (
+        _normalize_compare_value(row.get("symbol")),
+        _normalize_compare_value(row.get("type")),
+        _normalize_compare_value(volume),
+        _normalize_compare_value(row.get("price_open")),
+        _normalize_compare_value(row.get("sl")),
+        _normalize_compare_value(row.get("tp")),
+    )
 
 
 def _normalize_compare_value(value: Any) -> str:
